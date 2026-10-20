@@ -16,6 +16,8 @@ const DATA_DIR = env.DATA_DIR || path.join(__dirname, 'data');
 const TZ = env.TZ || 'Europe/Zurich';
 const GOOGLE_CLIENT_ID = env.GOOGLE_CLIENT_ID || '';
 const GOOGLE_CLIENT_SECRET = env.GOOGLE_CLIENT_SECRET || '';
+const GUEST_REMIND_DAYS = +(env.GUEST_REMIND_DAYS || 60); // so lange nicht mehr da -> Erinnerung
+const GUEST_REMIND_REPEAT = +(env.GUEST_REMIND_REPEAT || 14); // danach alle n Tage wiederholen
 const DEV_LOGIN = env.DEV_LOGIN === '1'; // nur lokal zum Testen
 const SECURE_COOKIE = PUBLIC_URL.startsWith('https://');
 // ALLOWED_USERS="alex:alex@example.com,sam:sam@example.com" (Reihenfolge zählt für die Standard-Aufgaben)
@@ -40,6 +42,7 @@ CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY, by TEXT, points INTEGER 
 CREATE TABLE IF NOT EXISTS subs (endpoint TEXT PRIMARY KEY, user TEXT NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at TEXT);
 CREATE TABLE IF NOT EXISTS user_settings (user TEXT PRIMARY KEY, morning TEXT NOT NULL DEFAULT '09:00', evening TEXT NOT NULL DEFAULT '18:00');
 CREATE TABLE IF NOT EXISTS push_sent (user TEXT, slot TEXT, date TEXT, PRIMARY KEY (user, slot, date));
+CREATE TABLE IF NOT EXISTS guest_reminders (guest_id INTEGER NOT NULL, user TEXT NOT NULL, date TEXT NOT NULL, PRIMARY KEY (guest_id, user));
 CREATE TABLE IF NOT EXISTS meals (date TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT, updated_by TEXT, updated_at TEXT);
 `);
 const q = (sql) => db.prepare(sql);
@@ -185,6 +188,8 @@ function state(user) {
     log: q('SELECT by, points, type, date FROM log WHERE date >= ? ORDER BY date').all(new Date(Date.now() - 400 * 864e5).toISOString().slice(0, 10)),
     totalPoints: q('SELECT COALESCE(SUM(points),0) AS s FROM log').get().s,
     meals: q('SELECT date, title, note FROM meals WHERE date >= ? AND date <= ? ORDER BY date').all(dateStr(weekStart(localNow().date) - 7), dateStr(weekStart(localNow().date) + 13)),
+    longAbsent: longAbsentGuests(),
+    guestRemindDays: GUEST_REMIND_DAYS,
     mealIdeas: q('SELECT title, COUNT(*) AS n FROM meals GROUP BY lower(title) ORDER BY n DESC, max(date) DESC LIMIT 60').all().map(r => r.title),
   };
 }
@@ -241,7 +246,7 @@ const ops = {
   todoDelete(id) { const t = ops.todoGet(id); q('DELETE FROM todos WHERE id=?').run(t.id); q("DELETE FROM log WHERE type='todo' AND ref=?").run(String(t.id)); return { ok: true }; },
   mealSet(user, date, title, note) { const r = setMeal(user, date, title, note); if (r.error) fail(400, r.error); return r; },
   guestAdd(b) { const name = str(b.name, 80); if (!name) fail(400, 'Bitte einen Namen angeben.'); const r = q('INSERT INTO guests(name,created_at) VALUES(?,?)').run(name, nowIso()); return { ok: true, id: Number(r.lastInsertRowid) }; },
-  guestDelete(id) { if (!q('SELECT 1 FROM guests WHERE id=?').get(+id)) fail(404, 'Person nicht gefunden'); q('DELETE FROM guests WHERE id=?').run(+id); q('DELETE FROM visit_guests WHERE guest_id=?').run(+id); return { ok: true }; },
+  guestDelete(id) { if (!q('SELECT 1 FROM guests WHERE id=?').get(+id)) fail(404, 'Person nicht gefunden'); q('DELETE FROM guests WHERE id=?').run(+id); q('DELETE FROM visit_guests WHERE guest_id=?').run(+id); q('DELETE FROM guest_reminders WHERE guest_id=?').run(+id); return { ok: true }; },
   visitAdd(user, b) {
     const date = str(b.date, 10), note = str(b.note, 200), today = localNow().date;
     const ids = Array.isArray(b.guestIds) ? [...new Set(b.guestIds.map(Number).filter(Number.isInteger))].slice(0, 30) : [];
@@ -370,6 +375,14 @@ function dueFor(user) {
   const guestDays = lastVisit ? daysSince(lastVisit) : null;
   return { chores, todos, guestOverdue: guestDays === null ? false : guestDays >= 7, guestDays };
 }
+// Freunde, die seit GUEST_REMIND_DAYS nicht mehr da waren (ohne Besuch: ab Erfassungsdatum)
+function longAbsentGuests() {
+  const today = dayNum(localNow().date);
+  return q('SELECT g.id, g.name, g.created_at, (SELECT max(v.date) FROM visits v JOIN visit_guests vg ON vg.visit_id=v.id WHERE vg.guest_id=g.id) AS last_visit FROM guests g').all()
+    .map(g => { const since = g.last_visit || (g.created_at || '').slice(0, 10); return { id: g.id, name: g.name, last_visit: g.last_visit, days: isDate(since) ? today - dayNum(since) : 0 }; })
+    .filter(g => g.days >= GUEST_REMIND_DAYS).sort((a, b) => b.days - a.days);
+}
+
 function buildMessage(user, slot) {
   const d = dueFor(user);
   const lines = [];
@@ -377,6 +390,13 @@ function buildMessage(user, slot) {
   if (d.todos.length) lines.push((d.todos.length === 1 ? 'To-do: ' : `${d.todos.length} To-dos: `) + d.todos.slice(0, 3).map(t => t.title).join(', ') + (d.todos.length > 3 ? ' …' : ''));
   if (d.guestOverdue) lines.push(`Seit ${d.guestDays} Tagen kein Besuch. Wen ladet ihr ein?`);
   const today = localNow().date, dnum = dayNum(today);
+  if (slot === 'evening') {
+    const due = longAbsentGuests().filter(g => { const r = q('SELECT date FROM guest_reminders WHERE guest_id=? AND user=?').get(g.id, user); return !r || dnum - dayNum(r.date) >= GUEST_REMIND_REPEAT; });
+    if (due.length) {
+      lines.push('Lange nicht gesehen: ' + due.slice(0, 4).map(g => `${g.name} (${g.last_visit ? 'seit ' + g.days + ' Tagen' : 'noch nie da'})`).join(', ') + (due.length > 4 ? ' …' : '') + '. Zeit für eine Einladung?');
+      for (const g of due) q('INSERT INTO guest_reminders(guest_id,user,date) VALUES(?,?,?) ON CONFLICT(guest_id,user) DO UPDATE SET date=excluded.date').run(g.id, user, today);
+    }
+  }
   const meal = q('SELECT title FROM meals WHERE date=?').get(today);
   if (slot === 'morning') lines.unshift(meal ? `Heute gibt es: ${meal.title}` : 'Für heute ist noch kein Essen geplant.');
   // Sonntag: Plan für die nächste Woche
@@ -480,7 +500,7 @@ function overview() {
     due_chores: chores.filter(c => c.due_in_days <= 0),
     open_todos: q('SELECT id, title, due, assignee FROM todos WHERE done=0 ORDER BY COALESCE(due, \'9999\'), id').all(),
     meals: q('SELECT date, title, note FROM meals WHERE date >= ? AND date <= ? ORDER BY date').all(dateStr(ws), dateStr(ws + 13)).map(m => ({ ...m, weekday: wdOf(m.date) })),
-    guests: { last_visit: lastVisit, days_since: lastVisit ? dayNum(today) - dayNum(lastVisit) : null, goal: 'jede Woche jemand zu Gast' },
+    guests: { last_visit: lastVisit, days_since: lastVisit ? dayNum(today) - dayNum(lastVisit) : null, goal: 'jede Woche jemand zu Gast', long_absent: longAbsentGuests(), long_absent_threshold_days: GUEST_REMIND_DAYS },
   };
 }
 const P = (type, description, extra = {}) => ({ type, description, ...extra });

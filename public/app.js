@@ -124,6 +124,12 @@ function render() {
     gpill.className = 'pill ' + c; gpill.textContent = t;
   }
 
+  // Lange nicht gesehen
+  $('absentBox').hidden = !S.longAbsent.length;
+  $('absentHint').textContent = 'Seit über ' + Math.round(S.guestRemindDays / 30) + ' Monaten nicht mehr da:';
+  const al = $('absentList'); al.innerHTML = '';
+  for (const g of S.longAbsent) al.appendChild(li('<div class="who"><b>' + esc(g.name) + '</b><div>' + (g.last_visit ? 'zuletzt am ' + fmt(g.last_visit) + ', vor ' + g.days + ' Tagen' : 'noch nie da') + '</div></div>'));
+
   // Haushalt
   const cl = $('choreList'); cl.innerHTML = '';
   const order = S.chores.map(c => ({ c, s: choreState(c) })).sort((a, b) => (a.c.assignee === S.me ? 0 : 1) - (b.c.assignee === S.me ? 0 : 1) || (b.s.due - a.s.due) || (b.s.over - a.s.over) || a.c.name.localeCompare(b.c.name));

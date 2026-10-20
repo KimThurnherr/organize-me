@@ -15,6 +15,7 @@ Ohne externe Abhängigkeiten: Node 24 (`node:http`, `node:sqlite`, `node:crypto`
 | `GITHUB_REPO` / `GITHUB_REF` | `owner/repo`, `main` | Woher der Container den Code beim Start holt |
 | `BIND_ADDR` / `HOST_PORT` | `127.0.0.1`, `8080` | Wo der Port auf dem Host veröffentlicht wird (hinter einem Reverse Proxy mit TLS betreiben) |
 | `MCP_TOKENS` | `shared:<token>` oder `alex:<token>,sam:<token>` | Bearer-Tokens für die MCP-Schnittstelle unter `/mcp` (mind. 32 Zeichen): ein gemeinsames Token, bei dem die Person pro Aufruf angegeben wird, oder eines pro Person. Ohne Eintrag ist die Schnittstelle gesperrt. |
+| `GUEST_REMIND_DAYS` / `GUEST_REMIND_REPEAT` | `60`, `14` | Erinnerung im Abend-Push, wenn jemand so viele Tage nicht mehr zu Gast war, danach alle n Tage wiederholt |
 | `TZ` | `Europe/Zurich` | Zeitzone für Fälligkeiten und Push-Zeiten |
 
 ## Lokal starten
