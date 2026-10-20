@@ -1,6 +1,6 @@
 # Flechte
 
-Kleine Haushalts-PWA für zwei Personen: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Gäste-Rhythmus (jede Woche jemand zu Gast), gemeinsames Wochenziel mit Punkten und Serie sowie Web-Push morgens und abends.
+Kleine Haushalts-PWA für zwei Personen: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (jede Woche jemand zu Gast), gemeinsames Wochenziel mit Punkten und Serie, ein KI-Assistent für Fragen wie «Was koche ich heute?» sowie Web-Push morgens und abends.
 
 Ohne externe Abhängigkeiten: Node 24 (`node:http`, `node:sqlite`, `node:crypto`). Web-Push (RFC 8291/8292) ist selbst implementiert, VAPID-Schlüssel und Session-Secret werden beim ersten Start erzeugt und im Datenvolume gespeichert.
 
@@ -14,6 +14,7 @@ Ohne externe Abhängigkeiten: Node 24 (`node:http`, `node:sqlite`, `node:crypto`
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | | OAuth-Client (Webanwendung), Redirect-URI `<PUBLIC_URL>/auth/callback` |
 | `GITHUB_REPO` / `GITHUB_REF` | `owner/repo`, `main` | Woher der Container den Code beim Start holt |
 | `BIND_ADDR` / `HOST_PORT` | `127.0.0.1`, `8080` | Wo der Port auf dem Host veröffentlicht wird (hinter einem Reverse Proxy mit TLS betreiben) |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` / `AI_DAILY_LIMIT` | `claude-sonnet-5-5`, `60` | Optional: KI-Reiter «Fragen». Ohne Key ist er ausgeblendet. |
 | `TZ` | `Europe/Zurich` | Zeitzone für Fälligkeiten und Push-Zeiten |
 
 ## Lokal starten

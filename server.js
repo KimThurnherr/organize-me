@@ -16,6 +16,10 @@ const DATA_DIR = env.DATA_DIR || path.join(__dirname, 'data');
 const TZ = env.TZ || 'Europe/Zurich';
 const GOOGLE_CLIENT_ID = env.GOOGLE_CLIENT_ID || '';
 const GOOGLE_CLIENT_SECRET = env.GOOGLE_CLIENT_SECRET || '';
+const ANTHROPIC_API_KEY = env.ANTHROPIC_API_KEY || '';
+const ANTHROPIC_URL = (env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/$/, '');
+const ANTHROPIC_MODEL = env.ANTHROPIC_MODEL || 'claude-sonnet-5-5';
+const AI_DAILY_LIMIT = +(env.AI_DAILY_LIMIT || 60);
 const DEV_LOGIN = env.DEV_LOGIN === '1'; // nur lokal zum Testen
 const SECURE_COOKIE = PUBLIC_URL.startsWith('https://');
 // ALLOWED_USERS="alex:alex@example.com,sam:sam@example.com" (Reihenfolge zählt für die Standard-Aufgaben)
@@ -40,6 +44,8 @@ CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY, by TEXT, points INTEGER 
 CREATE TABLE IF NOT EXISTS subs (endpoint TEXT PRIMARY KEY, user TEXT NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at TEXT);
 CREATE TABLE IF NOT EXISTS user_settings (user TEXT PRIMARY KEY, morning TEXT NOT NULL DEFAULT '09:00', evening TEXT NOT NULL DEFAULT '18:00');
 CREATE TABLE IF NOT EXISTS push_sent (user TEXT, slot TEXT, date TEXT, PRIMARY KEY (user, slot, date));
+CREATE TABLE IF NOT EXISTS meals (date TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT, updated_by TEXT, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS ai_usage (user TEXT, date TEXT, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user, date));
 `);
 const q = (sql) => db.prepare(sql);
 const meta = {
@@ -95,8 +101,21 @@ function localNow() { const p = Object.fromEntries(partsFmt.formatToParts(new Da
 const dayNum = s => { const [y, m, d] = s.split('-').map(Number); return Date.UTC(y, m - 1, d) / 864e5; };
 const daysSince = s => dayNum(localNow().date) - dayNum(s);
 const weekStart = s => { const n = dayNum(s); return n - ((new Date(n * 864e5).getUTCDay() + 6) % 7); };
+const dateStr = n => new Date(n * 864e5).toISOString().slice(0, 10);
 const isDate = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(dayNum(s));
 const isTime = s => typeof s === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
+
+// Erste Fälligkeiten verteilen, damit nicht alle Aufgaben am selben Tag fällig sind (einmalig)
+if (meta.get('staggered') !== '1') {
+  const today = dayNum(localNow().date);
+  const rows = q('SELECT * FROM chores WHERE last_done IS NULL ORDER BY interval_days, id').all();
+  rows.forEach((c, i) => {
+    if (q("SELECT 1 FROM log WHERE type='chore' AND ref=?").get(String(c.id))) return;
+    const offset = c.interval_days <= 1 ? 1 : (i % c.interval_days) + 1; // fällig in 0 .. interval-1 Tagen
+    q('UPDATE chores SET last_done=? WHERE id=?').run(dateStr(today - offset), c.id);
+  });
+  meta.set('staggered', '1');
+}
 
 // ---------- Session ----------
 function sign(v) { return crypto.createHmac('sha256', SESSION_SECRET).update(v).digest('base64url'); }
@@ -170,6 +189,9 @@ function state(user) {
     visits: q('SELECT * FROM visits ORDER BY date DESC, id DESC LIMIT 200').all().map(v => ({ ...v, guestIds: q('SELECT guest_id FROM visit_guests WHERE visit_id=?').all(v.id).map(r => r.guest_id) })),
     log: q('SELECT by, points, type, date FROM log WHERE date >= ? ORDER BY date').all(new Date(Date.now() - 400 * 864e5).toISOString().slice(0, 10)),
     totalPoints: q('SELECT COALESCE(SUM(points),0) AS s FROM log').get().s,
+    meals: q('SELECT date, title, note FROM meals WHERE date >= ? AND date <= ? ORDER BY date').all(dateStr(weekStart(localNow().date) - 7), dateStr(weekStart(localNow().date) + 13)),
+    mealIdeas: q('SELECT title, COUNT(*) AS n FROM meals GROUP BY lower(title) ORDER BY n DESC, max(date) DESC LIMIT 60').all().map(r => r.title),
+    aiEnabled: !!ANTHROPIC_API_KEY,
   };
 }
 
@@ -233,6 +255,16 @@ async function api(req, res, user, route) {
     return send(res, 200, { ok: true });
   }
 
+  // Essensplan
+  if (m === 'POST' && route === 'meals') {
+    const r = setMeal(user, body.date, body.title, body.note);
+    if (r.error) return send(res, 400, r);
+    return send(res, 200, r);
+  }
+
+  // KI
+  if (m === 'POST' && route === 'ai') return await aiChat(req, res, user, body);
+
   // Gäste
   if (m === 'POST' && route === 'guests') {
     const name = str(body.name, 80); if (!name) return send(res, 400, { error: 'Bitte einen Namen angeben.' });
@@ -276,6 +308,80 @@ async function api(req, res, user, route) {
 
   return send(res, 404, { error: 'Unbekannte Aktion' });
 }
+
+// ---------- Essensplan ----------
+function setMeal(user, date, title, note) {
+  date = str(date, 10); title = str(title, 120); note = str(note, 300);
+  if (!isDate(date)) return { error: 'Ungültiges Datum' };
+  if (!title) { q('DELETE FROM meals WHERE date=?').run(date); return { ok: true, removed: true }; }
+  q('INSERT INTO meals(date,title,note,updated_by,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET title=excluded.title, note=excluded.note, updated_by=excluded.updated_by, updated_at=excluded.updated_at').run(date, title, note, user, new Date().toISOString());
+  // Wochenplan mit mindestens 5 Tagen gibt einmal pro Woche 10 Punkte
+  const ws = weekStart(date);
+  const n = q('SELECT COUNT(*) AS n FROM meals WHERE date >= ? AND date <= ?').get(dateStr(ws), dateStr(ws + 6)).n;
+  let points = 0;
+  if (n >= 5 && !q("SELECT 1 FROM log WHERE type='plan' AND ref=?").get(String(ws))) { addLog(user, 10, 'plan', 'Essensplan', ws); points = 10; }
+  return { ok: true, points };
+}
+
+// ---------- KI (Anthropic Messages API) ----------
+const AI_TOOLS = [
+  { name: 'set_meal', description: 'Trägt ein Gericht für ein Datum in den Essensplan ein oder ersetzt es. Leerer Titel löscht den Eintrag.', input_schema: { type: 'object', properties: { date: { type: 'string', description: 'YYYY-MM-DD' }, title: { type: 'string' }, note: { type: 'string' } }, required: ['date', 'title'] } },
+  { name: 'add_todo', description: 'Legt ein To-do an, z.B. Einkaufsliste oder Erledigungen.', input_schema: { type: 'object', properties: { title: { type: 'string' }, due: { type: 'string', description: 'YYYY-MM-DD, optional' }, assignee: { type: 'string', description: 'Schlüssel der Person, leer für beide' } }, required: ['title'] } },
+];
+function aiContext(user) {
+  const st = state(user), today = st.today;
+  const names = Object.fromEntries(st.users.map(u => [u.key, u.name]));
+  const wd = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+  const lines = [];
+  lines.push(`Heute: ${wd[new Date(dayNum(today) * 864e5).getUTCDay()]} ${today}. Angemeldet: ${names[user]} (Schlüssel ${user}). Personen: ${st.users.map(u => `${u.name}=${u.key}`).join(', ')}.`);
+  lines.push('Essensplan: ' + (st.meals.map(x => `${x.date} (${wd[new Date(dayNum(x.date) * 864e5).getUTCDay()]}): ${x.title}${x.note ? ' – ' + x.note : ''}`).join('; ') || 'leer'));
+  lines.push('Bisher gekochte Gerichte: ' + (st.mealIdeas.slice(0, 40).join(', ') || 'keine'));
+  lines.push('Haushaltsaufgaben: ' + st.chores.map(c => `${c.name} (${names[c.assignee]}, alle ${c.interval_days} Tage, zuletzt ${c.last_by ? c.last_done : 'unbekannt'})`).join('; '));
+  lines.push('Offene To-dos: ' + (st.todos.filter(t => !t.done).map(t => `${t.title}${t.due ? ' bis ' + t.due : ''}${t.assignee ? ' für ' + names[t.assignee] : ''}`).join('; ') || 'keine'));
+  const lastVisit = st.visits[0]?.date;
+  lines.push(`Gäste: Ziel jede Woche jemand zu Gast. Letzter Besuch: ${lastVisit || 'noch keiner'}. Freunde: ${st.guests.map(g => g.name).join(', ') || 'keine erfasst'}.`);
+  return lines.join('\n');
+}
+async function aiChat(req, res, user, body) {
+  if (!ANTHROPIC_API_KEY) return send(res, 503, { error: 'Die KI ist noch nicht eingerichtet.' });
+  const today = localNow().date;
+  const used = q('SELECT n FROM ai_usage WHERE user=? AND date=?').get(user, today)?.n || 0;
+  if (used >= AI_DAILY_LIMIT) return send(res, 429, { error: 'Tageslimit für Fragen erreicht.' });
+  q('INSERT INTO ai_usage(user,date,n) VALUES(?,?,1) ON CONFLICT(user,date) DO UPDATE SET n=n+1').run(user, today);
+  const hist = Array.isArray(body.messages) ? body.messages.slice(-12) : [];
+  const messages = hist.filter(x => x && (x.role === 'user' || x.role === 'assistant') && typeof x.content === 'string' && x.content.trim()).map(x => ({ role: x.role, content: x.content.slice(0, 4000) }));
+  if (!messages.length || messages[messages.length - 1].role !== 'user') return send(res, 400, { error: 'Keine Frage' });
+  while (messages[0]?.role !== 'user') messages.shift();
+  const system = 'Du bist der Haushaltsassistent in der App «Flechte» eines Paares in der Schweiz. Antworte auf Deutsch (Schweizer Schreibweise mit ss statt ß), kurz, freundlich und konkret, ohne Emojis. ' +
+    'Hilf bei Fragen wie «Was soll ich heute kochen?», Rezepten, Einkaufslisten, Haushalt und Einladungen. Nutze die Daten unten. ' +
+    'Ändere den Essensplan oder lege To-dos nur an, wenn die Person das ausdrücklich möchte. Erfinde keine Daten.\n\nAktuelle Daten:\n' + aiContext(user);
+  const actions = [];
+  let reply = '';
+  for (let round = 0; round < 5; round++) {
+    const r = await fetch(ANTHROPIC_URL + '/v1/messages', { method: 'POST', headers: { 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 1500, system, tools: AI_TOOLS, messages }) });
+    if (!r.ok) { console.error('KI-Fehler', r.status, (await r.text()).slice(0, 300)); return send(res, 502, { error: 'Die KI ist gerade nicht erreichbar.' }); }
+    const d = await r.json();
+    reply = d.content.filter(c => c.type === 'text').map(c => c.text).join('\n').trim() || reply;
+    const uses = d.content.filter(c => c.type === 'tool_use');
+    if (d.stop_reason !== 'tool_use' || !uses.length) break;
+    messages.push({ role: 'assistant', content: d.content });
+    const results = uses.map(u => {
+      let out;
+      try {
+        if (u.name === 'set_meal') { out = setMeal(user, u.input.date, u.input.title, u.input.note); if (!out.error) actions.push(`Essensplan ${fmt(u.input.date)}: ${u.input.title || 'entfernt'}`); }
+        else if (u.name === 'add_todo') {
+          const title = str(u.input.title, 140), due = u.input.due ? str(u.input.due, 10) : '', as = str(u.input.assignee, 20);
+          if (!title || (due && !isDate(due)) || (as && !isUser(as))) out = { error: 'Ungültige Angaben' };
+          else { q('INSERT INTO todos(title,due,assignee,created_by,created_at) VALUES(?,?,?,?,?)').run(title, due || null, as || null, user, new Date().toISOString()); out = { ok: true }; actions.push('To-do: ' + title); }
+        } else out = { error: 'Unbekanntes Werkzeug' };
+      } catch (e) { out = { error: e.message }; }
+      return { type: 'tool_result', tool_use_id: u.id, content: JSON.stringify(out), is_error: !!out.error };
+    });
+    messages.push({ role: 'user', content: results });
+  }
+  return send(res, 200, { reply: reply || 'Erledigt.', actions });
+}
+const fmt = s => s ? s.split('-').reverse().join('.') : '';
 
 // ---------- Web Push (RFC 8291 / RFC 8292) ----------
 function hmac(key, data) { return crypto.createHmac('sha256', key).update(data).digest(); }
@@ -329,6 +435,14 @@ function buildMessage(user, slot) {
   if (d.chores.length) lines.push((d.chores.length === 1 ? 'Fällig: ' : `${d.chores.length} Aufgaben fällig: `) + d.chores.slice(0, 4).map(c => c.name).join(', ') + (d.chores.length > 4 ? ' …' : ''));
   if (d.todos.length) lines.push((d.todos.length === 1 ? 'To-do: ' : `${d.todos.length} To-dos: `) + d.todos.slice(0, 3).map(t => t.title).join(', ') + (d.todos.length > 3 ? ' …' : ''));
   if (d.guestOverdue) lines.push(`Seit ${d.guestDays} Tagen kein Besuch. Wen ladet ihr ein?`);
+  const today = localNow().date, dnum = dayNum(today);
+  const meal = q('SELECT title FROM meals WHERE date=?').get(today);
+  if (slot === 'morning') lines.unshift(meal ? `Heute gibt es: ${meal.title}` : 'Für heute ist noch kein Essen geplant.');
+  // Sonntag: Plan für die nächste Woche
+  if (new Date(dnum * 864e5).getUTCDay() === 0) {
+    const n = q('SELECT COUNT(*) AS n FROM meals WHERE date >= ? AND date <= ?').get(dateStr(dnum + 1), dateStr(dnum + 7)).n;
+    if (n < 5) lines.push(`Essensplan für nächste Woche: erst ${n} von 7 Tagen geplant.`);
+  }
   if (!lines.length) return null;
   const goal = +meta.get('team_goal', 120);
   const ws = weekStart(localNow().date);

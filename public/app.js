@@ -1,6 +1,8 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let S = null, tab = 'home', pending = null, editing = null, selected = new Set(), busy = false;
+let weekOffset = null, mealsDirty = false, mealsKey = '', chat = [];
+try { chat = JSON.parse(sessionStorage.getItem('flechte_chat') || '[]'); } catch {}
 const NAME = k => S?.users.find(u => u.key === k)?.name || k || '';
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const dayNum = s => { const [y, m, d] = s.split('-').map(Number); return Date.UTC(y, m - 1, d) / 864e5; };
@@ -34,6 +36,7 @@ async function load() {
   try { S = await call('GET', 'state'); } catch { return; }
   $('login').hidden = true; $('app').hidden = false;
   $('whoami').textContent = NAME(S.me);
+  $('tabAsk').hidden = !S.aiEnabled; if (!S.aiEnabled && tab === 'ask') tab = 'home';
   render(); updatePushUi();
 }
 function showLogin() {
@@ -91,6 +94,9 @@ function render() {
     d.title = p + ' Punkte'; wk.appendChild(d);
   }
 
+  // Essen
+  renderMeals();
+
   // Fällig
   const dueChores = u => S.chores.filter(c => c.assignee === u).map(c => ({ c, s: choreState(c) })).filter(x => x.s.due).sort((a, b) => b.s.over - a.s.over);
   const dueTodos = u => S.todos.filter(t => !t.done && t.due && dayNum(t.due) <= dayNum(S.today) && (!t.assignee || t.assignee === u));
@@ -126,7 +132,7 @@ function render() {
   if (!order.length) cl.appendChild(li('<p class="empty">Noch keine Aufgaben.</p>'));
   for (const { c, s } of order) {
     if (editing === c.id) { cl.appendChild(editRow(c)); continue; }
-    const l = li('<div class="who"><b>' + esc(c.name) + '</b><div><span class="pill ' + s.cls + '">' + s.text + '</span> · ' + esc(NAME(c.assignee)) + ' · alle ' + c.interval_days + ' Tage' + (c.last_done ? ' · zuletzt ' + fmt(c.last_done) : '') + '</div></div><span class="pts">+' + c.points + '</span>');
+    const l = li('<div class="who"><b>' + esc(c.name) + '</b><div><span class="pill ' + s.cls + '">' + s.text + '</span> · ' + esc(NAME(c.assignee)) + ' · alle ' + c.interval_days + ' Tage' + (c.last_done && c.last_by ? ' · zuletzt ' + fmt(c.last_done) : '') + '</div></div><span class="pts">+' + c.points + '</span>');
     if (c.last_done !== S.today) l.appendChild(btn('Erledigt', 'done', () => act('POST', 'chores/' + c.id + '/done', null, d => '+' + d.points + ' Punkte fürs Team')));
     l.appendChild(btn('Ändern', 'link', () => { editing = c.id; pending = null; render(); }));
     cl.appendChild(l);
@@ -173,6 +179,39 @@ function render() {
   }
 }
 
+const WD = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+const dstr = n => new Date(n * 864e5).toISOString().slice(0, 10);
+function renderMeals() {
+  const todayN = dayNum(S.today), isSunday = new Date(todayN * 864e5).getUTCDay() === 0;
+  if (weekOffset === null) weekOffset = isSunday ? 1 : 0;
+  const meal = S.meals.find(m => m.date === S.today);
+  const mt = $('mealToday');
+  mt.className = 'meal-today' + (meal ? '' : ' none');
+  mt.textContent = meal ? meal.title + (meal.note ? ' (' + meal.note + ')' : '') : 'Noch nichts geplant. Unter «Fragen» kannst du dir etwas vorschlagen lassen.';
+  const nextPlanned = S.meals.filter(m => dayNum(m.date) > todayN && dayNum(m.date) <= todayN + 7).length;
+  const ph = $('planHint');
+  ph.hidden = !(isSunday && nextPlanned < 5);
+  ph.textContent = 'Heute ist Planungstag: Für die nächste Woche sind erst ' + nextPlanned + ' von 7 Tagen geplant.';
+  // Woche
+  const ws = weekStart(S.today) + weekOffset * 7;
+  $('weekLabel').textContent = weekOffset === 0 ? 'Diese Woche' : weekOffset === 1 ? 'Nächste Woche' : weekOffset === -1 ? 'Letzte Woche' : fmt(dstr(ws));
+  $('weekPrev').disabled = weekOffset <= -1; $('weekNext').disabled = weekOffset >= 1;
+  const key = ws + '|' + JSON.stringify(S.meals);
+  if (mealsDirty || key === mealsKey) return;
+  mealsKey = key;
+  const dl = $('mealIdeas'); dl.innerHTML = '';
+  for (const t of S.mealIdeas) dl.appendChild(new Option(t));
+  const ul = $('mealList'); ul.innerHTML = '';
+  for (let i = 0; i < 7; i++) {
+    const d = dstr(ws + i), m = S.meals.find(x => x.date === d);
+    const l = document.createElement('li');
+    l.innerHTML = '<div class="day' + (d === S.today ? ' today' : '') + '"><label class="dl" for="meal-' + d + '">' + WD[new Date((ws + i) * 864e5).getUTCDay()] + '<small>' + fmt(d).slice(0, 6) + '</small></label><input type="text" id="meal-' + d + '" data-date="' + d + '" list="mealIdeas" maxlength="120" placeholder="Gericht"></div>';
+    const inp = l.querySelector('input'); inp.value = m ? m.title : ''; inp.dataset.orig = inp.value;
+    inp.addEventListener('input', () => { mealsDirty = true; });
+    ul.appendChild(l);
+  }
+}
+
 function editRow(c) {
   const l = document.createElement('li');
   const f = document.createElement('form'); f.className = 'edit';
@@ -200,6 +239,50 @@ $('visitForm').addEventListener('submit', async e => {
 $('settingsForm').addEventListener('submit', async e => { e.preventDefault(); await act('POST', 'settings', { morning: $('sMorning').value, evening: $('sEvening').value, teamGoal: +$('sGoal').value }, 'Gespeichert'); });
 $('logout').addEventListener('click', async () => { await fetch('/auth/logout', { method: 'POST' }); location.href = '/'; });
 for (const b of document.querySelectorAll('.tab')) b.addEventListener('click', () => { tab = b.dataset.tab; pending = null; editing = null; render(); });
+
+// Essen
+$('toMeals').addEventListener('click', () => { tab = 'meals'; render(); });
+$('weekPrev').addEventListener('click', () => { if (mealsDirty) return toast('Bitte zuerst speichern'); weekOffset--; mealsKey = ''; render(); });
+$('weekNext').addEventListener('click', () => { if (mealsDirty) return toast('Bitte zuerst speichern'); weekOffset++; mealsKey = ''; render(); });
+$('mealForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const changed = [...document.querySelectorAll('#mealList input')].filter(i => i.value.trim() !== i.dataset.orig);
+  if (!changed.length) { mealsDirty = false; return toast('Nichts geändert'); }
+  let pts = 0;
+  try { for (const i of changed) { const d = await call('POST', 'meals', { date: i.dataset.date, title: i.value }); pts += d.points || 0; } }
+  catch (err) { return toast(err.message); }
+  mealsDirty = false; mealsKey = '';
+  toast(pts ? 'Plan gespeichert, +' + pts + ' Punkte fürs Team' : 'Plan gespeichert');
+  await load();
+});
+
+// Fragen
+function renderChat() {
+  const c = $('chat'); c.innerHTML = '';
+  if (!chat.length) { const p = document.createElement('p'); p.className = 'empty'; p.textContent = 'Noch keine Fragen gestellt.'; c.appendChild(p); }
+  for (const m of chat) {
+    const d = document.createElement('div'); d.className = 'msg ' + m.role; d.textContent = m.content;
+    if (m.actions?.length) { const a = document.createElement('div'); a.className = 'acts'; a.textContent = 'Eingetragen: ' + m.actions.join(', '); d.appendChild(a); }
+    c.appendChild(d);
+  }
+  c.scrollTop = c.scrollHeight;
+  try { sessionStorage.setItem('flechte_chat', JSON.stringify(chat.slice(-30))); } catch {}
+}
+$('askForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const q = $('askInput').value.trim(); if (!q) return;
+  chat.push({ role: 'user', content: q }); $('askInput').value = ''; renderChat();
+  const btn = $('askBtn'); btn.disabled = true; btn.textContent = 'Denke nach …';
+  try {
+    const d = await call('POST', 'ai', { messages: chat.map(m => ({ role: m.role, content: m.content })) });
+    chat.push({ role: 'assistant', content: d.reply, actions: d.actions });
+    if (d.actions?.length) { mealsKey = ''; await load(); }
+  } catch (err) { chat.push({ role: 'assistant', content: err.message }); }
+  btn.disabled = false; btn.textContent = 'Fragen'; renderChat();
+});
+$('askInput').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('askForm').requestSubmit(); });
+$('askClear').addEventListener('click', () => { chat = []; renderChat(); });
+renderChat();
 
 // Push
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);

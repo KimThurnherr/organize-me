@@ -34,8 +34,10 @@
     <nav class="tabs" role="tablist">
       <button class="tab" role="tab" data-tab="home">Heute<span class="badge" id="badgeHome" hidden></span></button>
       <button class="tab" role="tab" data-tab="chores">Haushalt</button>
+      <button class="tab" role="tab" data-tab="meals">Essen</button>
       <button class="tab" role="tab" data-tab="todos">To-dos</button>
       <button class="tab" role="tab" data-tab="guests">Gäste</button>
+      <button class="tab" role="tab" data-tab="ask" id="tabAsk">Fragen</button>
       <button class="tab" role="tab" data-tab="settings">Einstellungen</button>
     </nav>
 
@@ -43,6 +45,11 @@
 
     <!-- Heute -->
     <div data-panel="home" class="panel">
+      <div class="notice" id="planHint" hidden></div>
+      <div class="card">
+        <div class="goal-head"><h2>Heute kochen</h2><button class="link" type="button" id="toMeals">Wochenplan</button></div>
+        <div class="meal-today" id="mealToday"></div>
+      </div>
       <div class="card goal">
         <div class="goal-head">
           <h2>Teamziel diese Woche</h2>
@@ -81,6 +88,30 @@
           <label for="cWho">Wer<select id="cWho"></select></label>
         </div>
         <div><button class="ghost" type="submit">Hinzufügen</button></div>
+      </form>
+    </section>
+
+    <!-- Essen -->
+    <section data-panel="meals" class="panel" hidden>
+      <div><h2>Essensplan</h2><p class="hint">Am Sonntag die nächste Woche planen. Ab 5 geplanten Tagen gibt es 10 Punkte fürs Team.</p></div>
+      <div class="row weeknav">
+        <button class="ghost" type="button" id="weekPrev">Vorherige</button>
+        <strong id="weekLabel"></strong>
+        <button class="ghost" type="button" id="weekNext">Nächste</button>
+      </div>
+      <form class="card" id="mealForm"><ul class="list" id="mealList"></ul>
+        <div><button class="primary" type="submit">Plan speichern</button></div>
+      </form>
+      <datalist id="mealIdeas"></datalist>
+    </section>
+
+    <!-- Fragen -->
+    <section data-panel="ask" class="panel" hidden>
+      <div><h2>Fragen</h2><p class="hint">Zum Beispiel: «Was soll ich heute kochen?», «Schreib mir eine Einkaufsliste für morgen» oder «Plan uns die nächste Woche mit schnellen Gerichten».</p></div>
+      <div class="card chat" id="chat"></div>
+      <form class="card" id="askForm">
+        <label for="askInput">Deine Frage<textarea id="askInput" rows="3" maxlength="2000" required></textarea></label>
+        <div class="row"><button class="primary" type="submit" id="askBtn">Fragen</button><button class="link" type="button" id="askClear">Verlauf leeren</button></div>
       </form>
     </section>
 

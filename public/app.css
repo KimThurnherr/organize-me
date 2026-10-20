@@ -75,3 +75,21 @@ li.isdone .who b { text-decoration: line-through; color: var(--muted); }
 .toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(20px + env(safe-area-inset-bottom, 0px)); background: var(--fg); color: var(--bg); padding: 10px 16px; border-radius: 10px; font-weight: 600; max-width: calc(100% - 32px); z-index: 10; }
 .edit { display: grid; gap: 8px; width: 100%; }
 @media (prefers-reduced-motion: reduce) { .fill { transition: none; } }
+
+textarea { font: inherit; font-size: 16px; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; width: 100%; resize: vertical; }
+.meal-today { font-family: var(--display); font-size: 1.5rem; font-weight: 700; overflow-wrap: anywhere; }
+.meal-today.none { font-family: var(--body); font-size: 1rem; font-weight: 500; color: var(--muted); }
+.weeknav { justify-content: space-between; align-items: center; }
+.weeknav strong { font-family: var(--display); }
+.day { display: grid; grid-template-columns: 76px 1fr; gap: 10px; align-items: center; width: 100%; }
+.day .dl { font-weight: 600; font-size: .9rem; }
+.day .dl small { display: block; color: var(--muted); font-weight: 500; }
+.day.today .dl { color: var(--accent); }
+.chat { gap: 10px; max-height: 60vh; overflow-y: auto; }
+.msg { padding: 10px 12px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 92%; }
+.msg.user { background: var(--accent-soft); justify-self: end; }
+.msg.assistant { background: var(--bg); justify-self: start; }
+.msg .acts { margin-top: 6px; font-size: .8rem; color: var(--ok); }
+.wrap > *, #app > * { min-width: 0; }
+#app { display: grid; gap: 14px; min-width: 0; }
+.tabs { margin-bottom: 0; }
