@@ -14,7 +14,7 @@ Ohne externe Abhängigkeiten: Node 24 (`node:http`, `node:sqlite`, `node:crypto`
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | | OAuth-Client (Webanwendung), Redirect-URI `<PUBLIC_URL>/auth/callback` |
 | `GITHUB_REPO` / `GITHUB_REF` | `owner/repo`, `main` | Woher der Container den Code beim Start holt |
 | `BIND_ADDR` / `HOST_PORT` | `127.0.0.1`, `8080` | Wo der Port auf dem Host veröffentlicht wird (hinter einem Reverse Proxy mit TLS betreiben) |
-| `MCP_TOKENS` | `alex:<token>,sam:<token>` | Bearer-Tokens für die MCP-Schnittstelle unter `/mcp`, je Person eines (mind. 32 Zeichen). Ohne Eintrag ist die Schnittstelle gesperrt. |
+| `MCP_TOKENS` | `shared:<token>` oder `alex:<token>,sam:<token>` | Bearer-Tokens für die MCP-Schnittstelle unter `/mcp` (mind. 32 Zeichen): ein gemeinsames Token, bei dem die Person pro Aufruf angegeben wird, oder eines pro Person. Ohne Eintrag ist die Schnittstelle gesperrt. |
 | `TZ` | `Europe/Zurich` | Zeitzone für Fälligkeiten und Push-Zeiten |
 
 ## Lokal starten
@@ -36,4 +36,4 @@ Push funktioniert nur, wenn die Seite in Safari über «Teilen» → «Zum Home-
 
 ## MCP-Schnittstelle
 
-`POST <PUBLIC_URL>/mcp` (Streamable HTTP, JSON-Antworten, zustandslos) mit `Authorization: Bearer <token>`. Jedes Token handelt im Namen seiner Person. Werkzeuge: Überblick, Haushaltsaufgaben (anlegen, ändern, löschen, erledigen), To-dos, Essensplan lesen und setzen, Gäste und Besuche, Push-Zeiten und Teamziel. Begrenzt auf 120 Anfragen pro Minute und Token.
+`POST <PUBLIC_URL>/mcp` (Streamable HTTP, JSON-Antworten, zustandslos) mit `Authorization: Bearer <token>`. Mit einem persönlichen Token handelt der Aufruf im Namen dieser Person, mit dem gemeinsamen Token gibt der Parameter `person` an, wer handelt (erledigte Aufgaben zählen ohne Angabe für die zuständige Person). Werkzeuge: Überblick, Haushaltsaufgaben (anlegen, ändern, löschen, erledigen), To-dos, Essensplan lesen und setzen, Gäste und Besuche, Push-Zeiten und Teamziel. Begrenzt auf 120 Anfragen pro Minute und Token.
