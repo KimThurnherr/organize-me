@@ -209,7 +209,9 @@ const ops = {
   choreAdd(user, b) {
     const name = str(b.name, 80), iv = int(b.interval_days, 1, 365), pts = int(b.points ?? 10, 1, 100), as = str(b.assignee, 20);
     if (!name || !iv || !pts || !isUser(as)) fail(400, 'Bitte Name, Intervall (1-365 Tage), Punkte (1-100) und Person angeben.');
-    const r = q('INSERT INTO chores(name,interval_days,points,assignee,created_at) VALUES(?,?,?,?,?)').run(name, iv, pts, as, nowIso());
+    const due = b.next_due ? str(b.next_due, 10) : '';
+    if (due && !isDate(due)) fail(400, 'Ungültiges Datum (YYYY-MM-DD)');
+    const r = q('INSERT INTO chores(name,interval_days,points,assignee,due_override,created_at) VALUES(?,?,?,?,?,?)').run(name, iv, pts, as, due || null, nowIso());
     return { ok: true, id: Number(r.lastInsertRowid) };
   },
   choreGet(id) { const c = q('SELECT * FROM chores WHERE id=?').get(+id); if (!c) fail(404, 'Aufgabe nicht gefunden'); return c; },
@@ -524,7 +526,7 @@ const P = (type, description, extra = {}) => ({ type, description, ...extra });
 const MCP_TOOLS = [
   { name: 'get_overview', description: 'Überblick: heutiges Datum, Personen, Teamziel der Woche, fällige Haushaltsaufgaben, offene To-dos, Essensplan dieser und nächster Woche, Gäste-Status. Zuerst aufrufen, um den Kontext zu kennen.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => overview() },
   { name: 'list_chores', description: 'Alle wiederkehrenden Haushaltsaufgaben mit Person, Intervall, Punkten und Fälligkeit.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => q('SELECT * FROM chores ORDER BY name').all().map(choreView) },
-  { name: 'add_chore', description: 'Neue wiederkehrende Haushaltsaufgabe anlegen.', inputSchema: { type: 'object', properties: { name: P('string', 'Bezeichnung'), interval_days: P('integer', 'Alle wie viele Tage (1-365)'), points: P('integer', 'Punkte fürs Teamziel (1-100), Standard 10'), assignee: P('string', 'Schlüssel der zuständigen Person (siehe get_overview.people)') }, required: ['name', 'interval_days', 'assignee'] }, run: (u, a) => ops.choreAdd(u, a) },
+  { name: 'add_chore', description: 'Neue wiederkehrende Haushaltsaufgabe anlegen, optional mit erstem Fälligkeitsdatum.', inputSchema: { type: 'object', properties: { name: P('string', 'Bezeichnung'), interval_days: P('integer', 'Alle wie viele Tage (1-365)'), points: P('integer', 'Punkte fürs Teamziel (1-100), Standard 10'), assignee: P('string', 'Schlüssel der zuständigen Person (siehe get_overview.people)'), next_due: P('string', 'Erste Fälligkeit YYYY-MM-DD (optional, sonst sofort fällig)') }, required: ['name', 'interval_days', 'assignee'] }, run: (u, a) => ops.choreAdd(u, a) },
   { name: 'update_chore', description: 'Haushaltsaufgabe ändern (nur angegebene Felder), auch die nächste Fälligkeit verschieben.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), name: P('string', 'Neue Bezeichnung'), interval_days: P('integer', 'Neues Intervall in Tagen'), points: P('integer', 'Neue Punkte'), assignee: P('string', 'Neue zuständige Person'), next_due: P('string', 'Nächste Fälligkeit YYYY-MM-DD setzen (gilt bis zur nächsten Erledigung, danach wieder nach Intervall). Leerer String entfernt die manuelle Fälligkeit.') }, required: ['id'] }, run: (u, a) => ops.choreUpdate(a.id, a) },
   { name: 'delete_chore', description: 'Haushaltsaufgabe löschen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe') }, required: ['id'] }, destructive: true, run: (u, a) => ops.choreDelete(a.id) },
   { name: 'complete_chore', description: 'Haushaltsaufgabe als heute erledigt markieren (zählt fürs Teamziel, im Namen der verbundenen Person).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), person: { ...PERSON, description: 'Wer hat es erledigt. Ohne Angabe zählt es für die zuständige Person.' } }, required: ['id'] }, run: (u, a) => ops.choreDone(actor(u, a, ops.choreGet(a.id).assignee), a.id) },
@@ -569,7 +571,7 @@ async function handleMcp(req, res) {
     const isNote = msg.id === undefined;
     const ok = result => isNote ? null : { jsonrpc: '2.0', id: msg.id, result };
     switch (msg.method) {
-      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.0.0' }, instructions: MCP_INSTRUCTIONS });
+      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.1.0' }, instructions: MCP_INSTRUCTIONS });
       case 'ping': return ok({});
       case 'tools/list': return ok({ tools: MCP_TOOLS.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, annotations: { readOnlyHint: !!t.readOnly, destructiveHint: !!t.destructive, openWorldHint: false } })) });
       case 'tools/call': {
