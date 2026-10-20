@@ -37,7 +37,6 @@
       <button class="tab" role="tab" data-tab="meals">Essen</button>
       <button class="tab" role="tab" data-tab="todos">To-dos</button>
       <button class="tab" role="tab" data-tab="guests">Gäste</button>
-      <button class="tab" role="tab" data-tab="ask" id="tabAsk">Fragen</button>
       <button class="tab" role="tab" data-tab="settings">Einstellungen</button>
     </nav>
 
@@ -103,16 +102,6 @@
         <div><button class="primary" type="submit">Plan speichern</button></div>
       </form>
       <datalist id="mealIdeas"></datalist>
-    </section>
-
-    <!-- Fragen -->
-    <section data-panel="ask" class="panel" hidden>
-      <div><h2>Fragen</h2><p class="hint">Zum Beispiel: «Was soll ich heute kochen?», «Schreib mir eine Einkaufsliste für morgen» oder «Plan uns die nächste Woche mit schnellen Gerichten».</p></div>
-      <div class="card chat" id="chat"></div>
-      <form class="card" id="askForm">
-        <label for="askInput">Deine Frage<textarea id="askInput" rows="3" maxlength="2000" required></textarea></label>
-        <div class="row"><button class="primary" type="submit" id="askBtn">Fragen</button><button class="link" type="button" id="askClear">Verlauf leeren</button></div>
-      </form>
     </section>
 
     <!-- To-dos -->

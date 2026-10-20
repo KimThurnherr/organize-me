@@ -16,10 +16,6 @@ const DATA_DIR = env.DATA_DIR || path.join(__dirname, 'data');
 const TZ = env.TZ || 'Europe/Zurich';
 const GOOGLE_CLIENT_ID = env.GOOGLE_CLIENT_ID || '';
 const GOOGLE_CLIENT_SECRET = env.GOOGLE_CLIENT_SECRET || '';
-const ANTHROPIC_API_KEY = env.ANTHROPIC_API_KEY || '';
-const ANTHROPIC_URL = (env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/$/, '');
-const ANTHROPIC_MODEL = env.ANTHROPIC_MODEL || 'claude-sonnet-5-5';
-const AI_DAILY_LIMIT = +(env.AI_DAILY_LIMIT || 60);
 const DEV_LOGIN = env.DEV_LOGIN === '1'; // nur lokal zum Testen
 const SECURE_COOKIE = PUBLIC_URL.startsWith('https://');
 // ALLOWED_USERS="alex:alex@example.com,sam:sam@example.com" (Reihenfolge zählt für die Standard-Aufgaben)
@@ -45,7 +41,6 @@ CREATE TABLE IF NOT EXISTS subs (endpoint TEXT PRIMARY KEY, user TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS user_settings (user TEXT PRIMARY KEY, morning TEXT NOT NULL DEFAULT '09:00', evening TEXT NOT NULL DEFAULT '18:00');
 CREATE TABLE IF NOT EXISTS push_sent (user TEXT, slot TEXT, date TEXT, PRIMARY KEY (user, slot, date));
 CREATE TABLE IF NOT EXISTS meals (date TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT, updated_by TEXT, updated_at TEXT);
-CREATE TABLE IF NOT EXISTS ai_usage (user TEXT, date TEXT, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user, date));
 `);
 const q = (sql) => db.prepare(sql);
 const meta = {
@@ -191,7 +186,6 @@ function state(user) {
     totalPoints: q('SELECT COALESCE(SUM(points),0) AS s FROM log').get().s,
     meals: q('SELECT date, title, note FROM meals WHERE date >= ? AND date <= ? ORDER BY date').all(dateStr(weekStart(localNow().date) - 7), dateStr(weekStart(localNow().date) + 13)),
     mealIdeas: q('SELECT title, COUNT(*) AS n FROM meals GROUP BY lower(title) ORDER BY n DESC, max(date) DESC LIMIT 60').all().map(r => r.title),
-    aiEnabled: !!ANTHROPIC_API_KEY,
   };
 }
 
@@ -199,98 +193,103 @@ function addLog(by, points, type, label, ref, date) {
   q('INSERT INTO log(by,points,type,label,ref,date,at) VALUES(?,?,?,?,?,?,?)').run(by, points, type, label, String(ref ?? ''), date || localNow().date, new Date().toISOString());
 }
 
+// ---------- Fachlogik (von Web-API und MCP gemeinsam genutzt) ----------
+class OpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+const fail = (status, msg) => { throw new OpError(status, msg); };
+const nowIso = () => new Date().toISOString();
+const ops = {
+  choreAdd(user, b) {
+    const name = str(b.name, 80), iv = int(b.interval_days, 1, 365), pts = int(b.points ?? 10, 1, 100), as = str(b.assignee, 20);
+    if (!name || !iv || !pts || !isUser(as)) fail(400, 'Bitte Name, Intervall (1-365 Tage), Punkte (1-100) und Person angeben.');
+    const r = q('INSERT INTO chores(name,interval_days,points,assignee,created_at) VALUES(?,?,?,?,?)').run(name, iv, pts, as, nowIso());
+    return { ok: true, id: Number(r.lastInsertRowid) };
+  },
+  choreGet(id) { const c = q('SELECT * FROM chores WHERE id=?').get(+id); if (!c) fail(404, 'Aufgabe nicht gefunden'); return c; },
+  choreUpdate(id, b) {
+    const c = ops.choreGet(id);
+    const name = b.name !== undefined ? str(b.name, 80) : c.name;
+    const iv = b.interval_days !== undefined ? int(b.interval_days, 1, 365) : c.interval_days;
+    const pts = b.points !== undefined ? int(b.points, 1, 100) : c.points;
+    const as = b.assignee !== undefined ? str(b.assignee, 20) : c.assignee;
+    if (!name || !iv || !pts || !isUser(as)) fail(400, 'Ungültige Angaben');
+    q('UPDATE chores SET name=?, interval_days=?, points=?, assignee=? WHERE id=?').run(name, iv, pts, as, c.id);
+    return { ok: true };
+  },
+  choreDelete(id) { const c = ops.choreGet(id); q('DELETE FROM chores WHERE id=?').run(c.id); return { ok: true }; },
+  choreDone(user, id) {
+    const c = ops.choreGet(id), today = localNow().date;
+    if (c.last_done === today && c.last_by) fail(409, 'Heute schon erledigt');
+    q('UPDATE chores SET last_done=?, last_by=? WHERE id=?').run(today, user, c.id);
+    addLog(user, c.points, 'chore', c.name, c.id);
+    return { ok: true, points: c.points };
+  },
+  todoAdd(user, b) {
+    const title = str(b.title, 140), due = b.due ? str(b.due, 10) : '', as = b.assignee ? str(b.assignee, 20) : '';
+    if (!title) fail(400, 'Bitte einen Titel angeben.');
+    if (due && !isDate(due)) fail(400, 'Ungültiges Datum');
+    if (as && !isUser(as)) fail(400, 'Ungültige Person');
+    const r = q('INSERT INTO todos(title,due,assignee,created_by,created_at) VALUES(?,?,?,?,?)').run(title, due || null, as || null, user, nowIso());
+    return { ok: true, id: Number(r.lastInsertRowid) };
+  },
+  todoGet(id) { const t = q('SELECT * FROM todos WHERE id=?').get(+id); if (!t) fail(404, 'To-do nicht gefunden'); return t; },
+  todoSetDone(user, id, done) {
+    const t = ops.todoGet(id);
+    if (done && !t.done) { q('UPDATE todos SET done=1, done_by=?, done_at=? WHERE id=?').run(user, nowIso(), t.id); addLog(user, 5, 'todo', t.title, t.id); return { ok: true, points: 5 }; }
+    if (!done && t.done) { q('UPDATE todos SET done=0, done_by=NULL, done_at=NULL WHERE id=?').run(t.id); q("DELETE FROM log WHERE type='todo' AND ref=?").run(String(t.id)); }
+    return { ok: true };
+  },
+  todoDelete(id) { const t = ops.todoGet(id); q('DELETE FROM todos WHERE id=?').run(t.id); q("DELETE FROM log WHERE type='todo' AND ref=?").run(String(t.id)); return { ok: true }; },
+  mealSet(user, date, title, note) { const r = setMeal(user, date, title, note); if (r.error) fail(400, r.error); return r; },
+  guestAdd(b) { const name = str(b.name, 80); if (!name) fail(400, 'Bitte einen Namen angeben.'); const r = q('INSERT INTO guests(name,created_at) VALUES(?,?)').run(name, nowIso()); return { ok: true, id: Number(r.lastInsertRowid) }; },
+  guestDelete(id) { if (!q('SELECT 1 FROM guests WHERE id=?').get(+id)) fail(404, 'Person nicht gefunden'); q('DELETE FROM guests WHERE id=?').run(+id); q('DELETE FROM visit_guests WHERE guest_id=?').run(+id); return { ok: true }; },
+  visitAdd(user, b) {
+    const date = str(b.date, 10), note = str(b.note, 200), today = localNow().date;
+    const ids = Array.isArray(b.guestIds) ? [...new Set(b.guestIds.map(Number).filter(Number.isInteger))].slice(0, 30) : [];
+    if (!isDate(date) || dayNum(date) > dayNum(today)) fail(400, 'Ungültiges Datum (nicht in der Zukunft)');
+    const valid = ids.filter(g => q('SELECT 1 FROM guests WHERE id=?').get(g));
+    if (!valid.length) fail(400, 'Bitte mindestens eine erfasste Person angeben.');
+    const r = q('INSERT INTO visits(date,note,by,created_at) VALUES(?,?,?,?)').run(date, note, user, nowIso());
+    const vid = Number(r.lastInsertRowid);
+    for (const g of valid) q('INSERT OR IGNORE INTO visit_guests(visit_id,guest_id) VALUES(?,?)').run(vid, g);
+    for (const u of Object.keys(USERS)) addLog(u, 10, 'visit', 'Gäste', vid, date);
+    return { ok: true, id: vid, points: 10 };
+  },
+  visitDelete(id) { if (!q('SELECT 1 FROM visits WHERE id=?').get(+id)) fail(404, 'Besuch nicht gefunden'); q('DELETE FROM visits WHERE id=?').run(+id); q("DELETE FROM log WHERE type='visit' AND ref=?").run(String(+id)); return { ok: true }; },
+  settingsSet(user, b) {
+    const cur = q('SELECT morning, evening FROM user_settings WHERE user=?').get(user) || { morning: '09:00', evening: '18:00' };
+    const mo = b.morning !== undefined ? str(b.morning, 5) : cur.morning, ev = b.evening !== undefined ? str(b.evening, 5) : cur.evening;
+    if (!isTime(mo) || !isTime(ev)) fail(400, 'Ungültige Uhrzeit (HH:MM)');
+    q('INSERT INTO user_settings(user,morning,evening) VALUES(?,?,?) ON CONFLICT(user) DO UPDATE SET morning=excluded.morning, evening=excluded.evening').run(user, mo, ev);
+    if (b.teamGoal !== undefined) { const g = int(b.teamGoal, 10, 2000); if (!g) fail(400, 'Ungültiges Teamziel (10-2000)'); meta.set('team_goal', g); }
+    return { ok: true };
+  },
+};
+
 // ---------- API ----------
 async function api(req, res, user, route) {
   const m = req.method;
   // CSRF: schreibende Requests nur mit eigenem Header (SameSite=Lax + kein CORS)
   if (m !== 'GET' && req.headers['x-flechte'] !== '1') return send(res, 403, { error: 'csrf' });
   const body = m === 'GET' ? {} : await readBody(req);
-  const today = localNow().date;
   let mm;
-
-  if (m === 'GET' && route === 'state') return send(res, 200, state(user));
-
-  // Chores
-  if (m === 'POST' && route === 'chores') {
-    const name = str(body.name, 80), iv = int(body.interval_days, 1, 365), pts = int(body.points, 1, 100), as = str(body.assignee, 20);
-    if (!name || !iv || !pts || !isUser(as)) return send(res, 400, { error: 'Bitte Name, Intervall, Punkte und Person angeben.' });
-    q('INSERT INTO chores(name,interval_days,points,assignee,created_at) VALUES(?,?,?,?,?)').run(name, iv, pts, as, new Date().toISOString());
-    return send(res, 200, { ok: true });
-  }
-  if ((mm = route.match(/^chores\/(\d+)$/))) {
-    const c = q('SELECT * FROM chores WHERE id=?').get(+mm[1]); if (!c) return send(res, 404, { error: 'Aufgabe nicht gefunden' });
-    if (m === 'DELETE') { q('DELETE FROM chores WHERE id=?').run(c.id); return send(res, 200, { ok: true }); }
-    if (m === 'PATCH') {
-      const name = body.name !== undefined ? str(body.name, 80) : c.name;
-      const iv = body.interval_days !== undefined ? int(body.interval_days, 1, 365) : c.interval_days;
-      const pts = body.points !== undefined ? int(body.points, 1, 100) : c.points;
-      const as = body.assignee !== undefined ? str(body.assignee, 20) : c.assignee;
-      if (!name || !iv || !pts || !isUser(as)) return send(res, 400, { error: 'Ungültige Angaben' });
-      q('UPDATE chores SET name=?, interval_days=?, points=?, assignee=? WHERE id=?').run(name, iv, pts, as, c.id);
-      return send(res, 200, { ok: true });
-    }
-  }
-  if ((mm = route.match(/^chores\/(\d+)\/done$/)) && m === 'POST') {
-    const c = q('SELECT * FROM chores WHERE id=?').get(+mm[1]); if (!c) return send(res, 404, { error: 'Aufgabe nicht gefunden' });
-    if (c.last_done === today) return send(res, 409, { error: 'Heute schon erledigt' });
-    q('UPDATE chores SET last_done=?, last_by=? WHERE id=?').run(today, user, c.id);
-    addLog(user, c.points, 'chore', c.name, c.id);
-    return send(res, 200, { ok: true, points: c.points });
-  }
-
-  // To-dos
-  if (m === 'POST' && route === 'todos') {
-    const title = str(body.title, 140), due = body.due ? str(body.due, 10) : '', as = str(body.assignee, 20);
-    if (!title) return send(res, 400, { error: 'Bitte einen Titel angeben.' });
-    if (due && !isDate(due)) return send(res, 400, { error: 'Ungültiges Datum' });
-    if (as && !isUser(as)) return send(res, 400, { error: 'Ungültige Person' });
-    q('INSERT INTO todos(title,due,assignee,created_by,created_at) VALUES(?,?,?,?,?)').run(title, due || null, as || null, user, new Date().toISOString());
-    return send(res, 200, { ok: true });
-  }
-  if ((mm = route.match(/^todos\/(\d+)$/)) && m === 'DELETE') { q('DELETE FROM todos WHERE id=?').run(+mm[1]); q("DELETE FROM log WHERE type='todo' AND ref=?").run(mm[1]); return send(res, 200, { ok: true }); }
-  if ((mm = route.match(/^todos\/(\d+)\/toggle$/)) && m === 'POST') {
-    const t = q('SELECT * FROM todos WHERE id=?').get(+mm[1]); if (!t) return send(res, 404, { error: 'To-do nicht gefunden' });
-    if (!t.done) { q('UPDATE todos SET done=1, done_by=?, done_at=? WHERE id=?').run(user, new Date().toISOString(), t.id); addLog(user, 5, 'todo', t.title, t.id); return send(res, 200, { ok: true, points: 5 }); }
-    q('UPDATE todos SET done=0, done_by=NULL, done_at=NULL WHERE id=?').run(t.id); q("DELETE FROM log WHERE type='todo' AND ref=?").run(String(t.id));
-    return send(res, 200, { ok: true });
-  }
-
-  // Essensplan
-  if (m === 'POST' && route === 'meals') {
-    const r = setMeal(user, body.date, body.title, body.note);
-    if (r.error) return send(res, 400, r);
-    return send(res, 200, r);
-  }
-
-  // KI
-  if (m === 'POST' && route === 'ai') return await aiChat(req, res, user, body);
-
-  // Gäste
-  if (m === 'POST' && route === 'guests') {
-    const name = str(body.name, 80); if (!name) return send(res, 400, { error: 'Bitte einen Namen angeben.' });
-    q('INSERT INTO guests(name,created_at) VALUES(?,?)').run(name, new Date().toISOString()); return send(res, 200, { ok: true });
-  }
-  if ((mm = route.match(/^guests\/(\d+)$/)) && m === 'DELETE') { q('DELETE FROM guests WHERE id=?').run(+mm[1]); q('DELETE FROM visit_guests WHERE guest_id=?').run(+mm[1]); return send(res, 200, { ok: true }); }
-  if (m === 'POST' && route === 'visits') {
-    const date = str(body.date, 10), note = str(body.note, 200);
-    const ids = Array.isArray(body.guestIds) ? [...new Set(body.guestIds.map(Number).filter(Number.isInteger))].slice(0, 30) : [];
-    if (!isDate(date) || dayNum(date) > dayNum(today)) return send(res, 400, { error: 'Ungültiges Datum' });
-    if (!ids.length) return send(res, 400, { error: 'Bitte mindestens eine Person auswählen.' });
-    const r = q('INSERT INTO visits(date,note,by,created_at) VALUES(?,?,?,?)').run(date, note, user, new Date().toISOString());
-    const vid = Number(r.lastInsertRowid);
-    for (const g of ids) if (q('SELECT 1 FROM guests WHERE id=?').get(g)) q('INSERT OR IGNORE INTO visit_guests(visit_id,guest_id) VALUES(?,?)').run(vid, g);
-    for (const u of Object.keys(USERS)) addLog(u, 10, 'visit', 'Gäste', vid, date);
-    return send(res, 200, { ok: true, points: 10 });
-  }
-  if ((mm = route.match(/^visits\/(\d+)$/)) && m === 'DELETE') { q('DELETE FROM visits WHERE id=?').run(+mm[1]); q("DELETE FROM log WHERE type='visit' AND ref=?").run(mm[1]); return send(res, 200, { ok: true }); }
-
-  // Einstellungen
-  if (m === 'POST' && route === 'settings') {
-    const mo = str(body.morning, 5), ev = str(body.evening, 5);
-    if (!isTime(mo) || !isTime(ev)) return send(res, 400, { error: 'Ungültige Uhrzeit' });
-    q('INSERT INTO user_settings(user,morning,evening) VALUES(?,?,?) ON CONFLICT(user) DO UPDATE SET morning=excluded.morning, evening=excluded.evening').run(user, mo, ev);
-    if (body.teamGoal !== undefined) { const g = int(body.teamGoal, 10, 2000); if (!g) return send(res, 400, { error: 'Ungültiges Teamziel' }); meta.set('team_goal', g); }
-    return send(res, 200, { ok: true });
+  try {
+    if (m === 'GET' && route === 'state') return send(res, 200, state(user));
+    if (m === 'POST' && route === 'chores') return send(res, 200, ops.choreAdd(user, body));
+    if ((mm = route.match(/^chores\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.choreDelete(mm[1]));
+    if ((mm = route.match(/^chores\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.choreUpdate(mm[1], body));
+    if ((mm = route.match(/^chores\/(\d+)\/done$/)) && m === 'POST') return send(res, 200, ops.choreDone(user, mm[1]));
+    if (m === 'POST' && route === 'todos') return send(res, 200, ops.todoAdd(user, body));
+    if ((mm = route.match(/^todos\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.todoDelete(mm[1]));
+    if ((mm = route.match(/^todos\/(\d+)\/toggle$/)) && m === 'POST') return send(res, 200, ops.todoSetDone(user, mm[1], !ops.todoGet(mm[1]).done));
+    if (m === 'POST' && route === 'meals') return send(res, 200, ops.mealSet(user, body.date, body.title, body.note));
+    if (m === 'POST' && route === 'guests') return send(res, 200, ops.guestAdd(body));
+    if ((mm = route.match(/^guests\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.guestDelete(mm[1]));
+    if (m === 'POST' && route === 'visits') return send(res, 200, ops.visitAdd(user, body));
+    if ((mm = route.match(/^visits\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.visitDelete(mm[1]));
+    if (m === 'POST' && route === 'settings') return send(res, 200, ops.settingsSet(user, body));
+  } catch (e) {
+    if (e instanceof OpError) return send(res, e.status, { error: e.message });
+    throw e;
   }
 
   // Push-Abos
@@ -323,64 +322,6 @@ function setMeal(user, date, title, note) {
   return { ok: true, points };
 }
 
-// ---------- KI (Anthropic Messages API) ----------
-const AI_TOOLS = [
-  { name: 'set_meal', description: 'Trägt ein Gericht für ein Datum in den Essensplan ein oder ersetzt es. Leerer Titel löscht den Eintrag.', input_schema: { type: 'object', properties: { date: { type: 'string', description: 'YYYY-MM-DD' }, title: { type: 'string' }, note: { type: 'string' } }, required: ['date', 'title'] } },
-  { name: 'add_todo', description: 'Legt ein To-do an, z.B. Einkaufsliste oder Erledigungen.', input_schema: { type: 'object', properties: { title: { type: 'string' }, due: { type: 'string', description: 'YYYY-MM-DD, optional' }, assignee: { type: 'string', description: 'Schlüssel der Person, leer für beide' } }, required: ['title'] } },
-];
-function aiContext(user) {
-  const st = state(user), today = st.today;
-  const names = Object.fromEntries(st.users.map(u => [u.key, u.name]));
-  const wd = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
-  const lines = [];
-  lines.push(`Heute: ${wd[new Date(dayNum(today) * 864e5).getUTCDay()]} ${today}. Angemeldet: ${names[user]} (Schlüssel ${user}). Personen: ${st.users.map(u => `${u.name}=${u.key}`).join(', ')}.`);
-  lines.push('Essensplan: ' + (st.meals.map(x => `${x.date} (${wd[new Date(dayNum(x.date) * 864e5).getUTCDay()]}): ${x.title}${x.note ? ' – ' + x.note : ''}`).join('; ') || 'leer'));
-  lines.push('Bisher gekochte Gerichte: ' + (st.mealIdeas.slice(0, 40).join(', ') || 'keine'));
-  lines.push('Haushaltsaufgaben: ' + st.chores.map(c => `${c.name} (${names[c.assignee]}, alle ${c.interval_days} Tage, zuletzt ${c.last_by ? c.last_done : 'unbekannt'})`).join('; '));
-  lines.push('Offene To-dos: ' + (st.todos.filter(t => !t.done).map(t => `${t.title}${t.due ? ' bis ' + t.due : ''}${t.assignee ? ' für ' + names[t.assignee] : ''}`).join('; ') || 'keine'));
-  const lastVisit = st.visits[0]?.date;
-  lines.push(`Gäste: Ziel jede Woche jemand zu Gast. Letzter Besuch: ${lastVisit || 'noch keiner'}. Freunde: ${st.guests.map(g => g.name).join(', ') || 'keine erfasst'}.`);
-  return lines.join('\n');
-}
-async function aiChat(req, res, user, body) {
-  if (!ANTHROPIC_API_KEY) return send(res, 503, { error: 'Die KI ist noch nicht eingerichtet.' });
-  const today = localNow().date;
-  const used = q('SELECT n FROM ai_usage WHERE user=? AND date=?').get(user, today)?.n || 0;
-  if (used >= AI_DAILY_LIMIT) return send(res, 429, { error: 'Tageslimit für Fragen erreicht.' });
-  q('INSERT INTO ai_usage(user,date,n) VALUES(?,?,1) ON CONFLICT(user,date) DO UPDATE SET n=n+1').run(user, today);
-  const hist = Array.isArray(body.messages) ? body.messages.slice(-12) : [];
-  const messages = hist.filter(x => x && (x.role === 'user' || x.role === 'assistant') && typeof x.content === 'string' && x.content.trim()).map(x => ({ role: x.role, content: x.content.slice(0, 4000) }));
-  if (!messages.length || messages[messages.length - 1].role !== 'user') return send(res, 400, { error: 'Keine Frage' });
-  while (messages[0]?.role !== 'user') messages.shift();
-  const system = 'Du bist der Haushaltsassistent in der App «Flechte» eines Paares in der Schweiz. Antworte auf Deutsch (Schweizer Schreibweise mit ss statt ß), kurz, freundlich und konkret, ohne Emojis. ' +
-    'Hilf bei Fragen wie «Was soll ich heute kochen?», Rezepten, Einkaufslisten, Haushalt und Einladungen. Nutze die Daten unten. ' +
-    'Ändere den Essensplan oder lege To-dos nur an, wenn die Person das ausdrücklich möchte. Erfinde keine Daten.\n\nAktuelle Daten:\n' + aiContext(user);
-  const actions = [];
-  let reply = '';
-  for (let round = 0; round < 5; round++) {
-    const r = await fetch(ANTHROPIC_URL + '/v1/messages', { method: 'POST', headers: { 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 1500, system, tools: AI_TOOLS, messages }) });
-    if (!r.ok) { console.error('KI-Fehler', r.status, (await r.text()).slice(0, 300)); return send(res, 502, { error: 'Die KI ist gerade nicht erreichbar.' }); }
-    const d = await r.json();
-    reply = d.content.filter(c => c.type === 'text').map(c => c.text).join('\n').trim() || reply;
-    const uses = d.content.filter(c => c.type === 'tool_use');
-    if (d.stop_reason !== 'tool_use' || !uses.length) break;
-    messages.push({ role: 'assistant', content: d.content });
-    const results = uses.map(u => {
-      let out;
-      try {
-        if (u.name === 'set_meal') { out = setMeal(user, u.input.date, u.input.title, u.input.note); if (!out.error) actions.push(`Essensplan ${fmt(u.input.date)}: ${u.input.title || 'entfernt'}`); }
-        else if (u.name === 'add_todo') {
-          const title = str(u.input.title, 140), due = u.input.due ? str(u.input.due, 10) : '', as = str(u.input.assignee, 20);
-          if (!title || (due && !isDate(due)) || (as && !isUser(as))) out = { error: 'Ungültige Angaben' };
-          else { q('INSERT INTO todos(title,due,assignee,created_by,created_at) VALUES(?,?,?,?,?)').run(title, due || null, as || null, user, new Date().toISOString()); out = { ok: true }; actions.push('To-do: ' + title); }
-        } else out = { error: 'Unbekanntes Werkzeug' };
-      } catch (e) { out = { error: e.message }; }
-      return { type: 'tool_result', tool_use_id: u.id, content: JSON.stringify(out), is_error: !!out.error };
-    });
-    messages.push({ role: 'user', content: results });
-  }
-  return send(res, 200, { reply: reply || 'Erledigt.', actions });
-}
 const fmt = s => s ? s.split('-').reverse().join('.') : '';
 
 // ---------- Web Push (RFC 8291 / RFC 8292) ----------
@@ -496,12 +437,121 @@ async function loginCallback(req, res, url) {
   redirect(res, '/');
 }
 
+// ---------- MCP-Schnittstelle (Streamable HTTP, zustandslos, JSON-RPC 2.0) ----------
+// MCP_TOKENS="alex:<langes-token>,sam:<langes-token>" - jedes Token handelt als diese Person.
+const MCP_TOKENS = (env.MCP_TOKENS || '').split(',').map(s => s.trim()).filter(Boolean).map(s => { const i = s.indexOf(':'); return [s.slice(0, i).trim().toLowerCase(), s.slice(i + 1).trim()]; }).filter(([u, t]) => isUser(u) && t.length >= 32);
+function mcpUser(req) {
+  const h = String(req.headers.authorization || ''), m = h.match(/^Bearer\s+(.+)$/i);
+  if (!m) return null;
+  const given = crypto.createHash('sha256').update(m[1].trim()).digest();
+  let found = null;
+  for (const [u, t] of MCP_TOKENS) { if (crypto.timingSafeEqual(given, crypto.createHash('sha256').update(t).digest())) found = u; }
+  return found;
+}
+const WD = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+const wdOf = d => WD[new Date(dayNum(d) * 864e5).getUTCDay()];
+const nameOf = u => USER_NAMES[u] || (u ? u.charAt(0).toUpperCase() + u.slice(1) : '');
+function choreView(c) {
+  const today = localNow().date;
+  const left = c.last_done ? c.interval_days - (dayNum(today) - dayNum(c.last_done)) : 0;
+  return { id: c.id, name: c.name, assignee: c.assignee, interval_days: c.interval_days, points: c.points, last_done: c.last_by ? c.last_done : null, last_done_by: c.last_by || null, due_in_days: left, due_date: dateStr(dayNum(today) + Math.max(left, 0)), overdue: left < 0 };
+}
+function overview() {
+  const today = localNow().date, ws = weekStart(today), goal = +meta.get('team_goal', 120);
+  const log = q('SELECT points, date FROM log WHERE date >= ?').all(dateStr(ws - 70));
+  const pts = w => log.filter(e => weekStart(e.date) === w).reduce((a, e) => a + e.points, 0);
+  let streak = 0; for (let w = ws - 7; ; w -= 7) { if (pts(w) >= goal) streak++; else break; }
+  const chores = q('SELECT * FROM chores ORDER BY name').all().map(choreView);
+  const lastVisit = q('SELECT date FROM visits ORDER BY date DESC LIMIT 1').get()?.date || null;
+  return {
+    today, weekday: wdOf(today),
+    people: Object.keys(USERS).map(k => ({ key: k, name: nameOf(k) })),
+    team_goal: { goal, points_this_week: pts(ws), weeks_in_a_row: streak },
+    due_chores: chores.filter(c => c.due_in_days <= 0),
+    open_todos: q('SELECT id, title, due, assignee FROM todos WHERE done=0 ORDER BY COALESCE(due, \'9999\'), id').all(),
+    meals: q('SELECT date, title, note FROM meals WHERE date >= ? AND date <= ? ORDER BY date').all(dateStr(ws), dateStr(ws + 13)).map(m => ({ ...m, weekday: wdOf(m.date) })),
+    guests: { last_visit: lastVisit, days_since: lastVisit ? dayNum(today) - dayNum(lastVisit) : null, goal: 'jede Woche jemand zu Gast' },
+  };
+}
+const P = (type, description, extra = {}) => ({ type, description, ...extra });
+const MCP_TOOLS = [
+  { name: 'get_overview', description: 'Überblick: heutiges Datum, Personen, Teamziel der Woche, fällige Haushaltsaufgaben, offene To-dos, Essensplan dieser und nächster Woche, Gäste-Status. Zuerst aufrufen, um den Kontext zu kennen.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => overview() },
+  { name: 'list_chores', description: 'Alle wiederkehrenden Haushaltsaufgaben mit Person, Intervall, Punkten und Fälligkeit.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => q('SELECT * FROM chores ORDER BY name').all().map(choreView) },
+  { name: 'add_chore', description: 'Neue wiederkehrende Haushaltsaufgabe anlegen.', inputSchema: { type: 'object', properties: { name: P('string', 'Bezeichnung'), interval_days: P('integer', 'Alle wie viele Tage (1-365)'), points: P('integer', 'Punkte fürs Teamziel (1-100), Standard 10'), assignee: P('string', 'Schlüssel der zuständigen Person (siehe get_overview.people)') }, required: ['name', 'interval_days', 'assignee'] }, run: (u, a) => ops.choreAdd(u, a) },
+  { name: 'update_chore', description: 'Haushaltsaufgabe ändern (nur angegebene Felder).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), name: P('string', 'Neue Bezeichnung'), interval_days: P('integer', 'Neues Intervall in Tagen'), points: P('integer', 'Neue Punkte'), assignee: P('string', 'Neue zuständige Person') }, required: ['id'] }, run: (u, a) => ops.choreUpdate(a.id, a) },
+  { name: 'delete_chore', description: 'Haushaltsaufgabe löschen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe') }, required: ['id'] }, destructive: true, run: (u, a) => ops.choreDelete(a.id) },
+  { name: 'complete_chore', description: 'Haushaltsaufgabe als heute erledigt markieren (zählt fürs Teamziel, im Namen der verbundenen Person).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe') }, required: ['id'] }, run: (u, a) => ops.choreDone(u, a.id) },
+  { name: 'list_todos', description: 'To-dos auflisten.', inputSchema: { type: 'object', properties: { include_done: P('boolean', 'Auch erledigte der letzten 30 Tage') } }, readOnly: true, run: (u, a) => q('SELECT id, title, due, assignee, done, done_by, done_at FROM todos WHERE done=0 OR (? AND done_at >= ?) ORDER BY done, COALESCE(due, \'9999\'), id').all(a.include_done ? 1 : 0, new Date(Date.now() - 30 * 864e5).toISOString()) },
+  { name: 'add_todo', description: 'Einmaliges To-do anlegen, z.B. Einkauf oder Erledigung.', inputSchema: { type: 'object', properties: { title: P('string', 'Was ist zu tun'), due: P('string', 'Fällig bis YYYY-MM-DD (optional)'), assignee: P('string', 'Schlüssel der Person, leer = beide') }, required: ['title'] }, run: (u, a) => ops.todoAdd(u, a) },
+  { name: 'set_todo_done', description: 'To-do als erledigt oder wieder offen markieren.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID des To-dos'), done: P('boolean', 'true = erledigt, false = wieder offen') }, required: ['id', 'done'] }, run: (u, a) => ops.todoSetDone(u, a.id, !!a.done) },
+  { name: 'delete_todo', description: 'To-do löschen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID des To-dos') }, required: ['id'] }, destructive: true, run: (u, a) => ops.todoDelete(a.id) },
+  { name: 'get_meal_plan', description: 'Essensplan für einen Zeitraum lesen, plus die am häufigsten gekochten Gerichte.', inputSchema: { type: 'object', properties: { from: P('string', 'YYYY-MM-DD, Standard Montag dieser Woche'), to: P('string', 'YYYY-MM-DD, Standard Sonntag nächster Woche') } }, readOnly: true, run: (u, a) => {
+      const ws = weekStart(localNow().date), from = isDate(a.from) ? a.from : dateStr(ws), to = isDate(a.to) ? a.to : dateStr(ws + 13);
+      return { from, to, meals: q('SELECT date, title, note FROM meals WHERE date >= ? AND date <= ? ORDER BY date').all(from, to).map(m => ({ ...m, weekday: wdOf(m.date) })), favorites: q('SELECT title, COUNT(*) AS times FROM meals GROUP BY lower(title) ORDER BY times DESC, max(date) DESC LIMIT 30').all() };
+    } },
+  { name: 'set_meals', description: 'Gerichte in den Essensplan eintragen oder ersetzen (ein oder mehrere Tage). Leerer Titel löscht den Tag. Ab 5 geplanten Tagen einer Woche gibt es einmalig 10 Punkte.', inputSchema: { type: 'object', properties: { meals: { type: 'array', maxItems: 31, items: { type: 'object', properties: { date: P('string', 'YYYY-MM-DD'), title: P('string', 'Gericht'), note: P('string', 'Notiz, z.B. Rezeptlink oder Zutaten') }, required: ['date', 'title'] } } }, required: ['meals'] }, run: (u, a) => {
+      if (!Array.isArray(a.meals) || !a.meals.length) fail(400, 'meals fehlt');
+      return { ok: true, results: a.meals.slice(0, 31).map(m => ({ date: m.date, ...ops.mealSet(u, m.date, m.title, m.note) })) };
+    } },
+  { name: 'list_guests', description: 'Erfasste Freunde mit letztem Besuch, sortiert nach «am längsten nicht mehr da».', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => q('SELECT g.id, g.name, (SELECT max(v.date) FROM visits v JOIN visit_guests vg ON vg.visit_id=v.id WHERE vg.guest_id=g.id) AS last_visit FROM guests g ORDER BY last_visit IS NOT NULL, last_visit, g.name').all() },
+  { name: 'add_guest', description: 'Freund oder Paar zur Gästeliste hinzufügen.', inputSchema: { type: 'object', properties: { name: P('string', 'Name') }, required: ['name'] }, run: (u, a) => ops.guestAdd(a) },
+  { name: 'delete_guest', description: 'Person aus der Gästeliste entfernen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID') }, required: ['id'] }, destructive: true, run: (u, a) => ops.guestDelete(a.id) },
+  { name: 'log_visit', description: 'Besuch eintragen (gibt beiden Personen je 10 Punkte).', inputSchema: { type: 'object', properties: { date: P('string', 'YYYY-MM-DD, nicht in der Zukunft'), guest_ids: { type: 'array', items: { type: 'integer' }, description: 'IDs aus list_guests' }, note: P('string', 'Notiz (optional)') }, required: ['date', 'guest_ids'] }, run: (u, a) => ops.visitAdd(u, { date: a.date, guestIds: a.guest_ids, note: a.note }) },
+  { name: 'list_visits', description: 'Letzte Besuche.', inputSchema: { type: 'object', properties: { limit: P('integer', 'Anzahl, Standard 20') } }, readOnly: true, run: (u, a) => q('SELECT id, date, note FROM visits ORDER BY date DESC, id DESC LIMIT ?').all(int(a.limit, 1, 200) || 20).map(v => ({ ...v, guests: q('SELECT g.name FROM visit_guests vg JOIN guests g ON g.id=vg.guest_id WHERE vg.visit_id=?').all(v.id).map(r => r.name) })) },
+  { name: 'delete_visit', description: 'Besuch löschen (Punkte werden zurückgenommen).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID') }, required: ['id'] }, destructive: true, run: (u, a) => ops.visitDelete(a.id) },
+  { name: 'get_settings', description: 'Push-Zeiten der verbundenen Person und Teamziel.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: (u) => ({ user: u, ...(q('SELECT morning, evening FROM user_settings WHERE user=?').get(u) || { morning: '09:00', evening: '18:00' }), team_goal: +meta.get('team_goal', 120) }) },
+  { name: 'update_settings', description: 'Push-Zeiten (HH:MM) der verbundenen Person und/oder das gemeinsame Wochen-Teamziel ändern.', inputSchema: { type: 'object', properties: { morning: P('string', 'HH:MM'), evening: P('string', 'HH:MM'), team_goal: P('integer', 'Punkte pro Woche (10-2000)') } }, run: (u, a) => ops.settingsSet(u, { morning: a.morning, evening: a.evening, teamGoal: a.team_goal }) },
+];
+const MCP_INSTRUCTIONS = 'Flechte ist die Haushalts-App eines Paares: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (Ziel: jede Woche jemand zu Gast) und ein gemeinsames Wochen-Teamziel in Punkten. Rufe zuerst get_overview auf. Daten sind auf Deutsch, Datumsformat YYYY-MM-DD, Zeitzone ' + TZ + '. Schreibende Aktionen laufen im Namen der Person, zu der das Token gehört.';
+const mcpRate = new Map();
+async function handleMcp(req, res) {
+  if (req.method === 'GET' || req.method === 'DELETE') return send(res, 405, { error: 'Nur POST' }, undefined, { Allow: 'POST' });
+  if (req.method !== 'POST') return send(res, 405, { error: 'Nur POST' });
+  const user = mcpUser(req);
+  if (!user) return send(res, 401, { error: 'unauthorized' }, undefined, { 'WWW-Authenticate': 'Bearer' });
+  const e = mcpRate.get(user) || { n: 0, t: Date.now() }; if (Date.now() - e.t > 6e4) { e.n = 0; e.t = Date.now(); } e.n++; mcpRate.set(user, e);
+  if (e.n > 120) return send(res, 429, { error: 'Zu viele Anfragen' });
+  let body; try { body = await readBody(req); } catch { return send(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }); }
+  const handle = async (msg) => {
+    if (!msg || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') return { jsonrpc: '2.0', id: msg?.id ?? null, error: { code: -32600, message: 'Invalid Request' } };
+    const isNote = msg.id === undefined;
+    const ok = result => isNote ? null : { jsonrpc: '2.0', id: msg.id, result };
+    switch (msg.method) {
+      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.0.0' }, instructions: MCP_INSTRUCTIONS });
+      case 'ping': return ok({});
+      case 'tools/list': return ok({ tools: MCP_TOOLS.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, annotations: { readOnlyHint: !!t.readOnly, destructiveHint: !!t.destructive, openWorldHint: false } })) });
+      case 'tools/call': {
+        const t = MCP_TOOLS.find(x => x.name === msg.params?.name);
+        if (!t) return { jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'Unbekanntes Werkzeug' } };
+        try {
+          const out = await t.run(user, msg.params?.arguments || {});
+          return ok({ content: [{ type: 'text', text: JSON.stringify(out, null, 1) }], structuredContent: Array.isArray(out) ? { items: out } : out });
+        } catch (err) {
+          if (!(err instanceof OpError)) console.error('MCP-Fehler', t.name, err);
+          return ok({ content: [{ type: 'text', text: err instanceof OpError ? err.message : 'Interner Fehler' }], isError: true });
+        }
+      }
+      default:
+        if (msg.method.startsWith('notifications/')) return null;
+        return isNote ? null : { jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'Method not found' } };
+    }
+  };
+  if (Array.isArray(body)) {
+    const out = (await Promise.all(body.slice(0, 20).map(handle))).filter(Boolean);
+    return out.length ? send(res, 200, out) : (res.writeHead(202, SEC_HEADERS), res.end());
+  }
+  const out = await handle(body);
+  if (!out) { res.writeHead(202, SEC_HEADERS); return res.end(); }
+  return send(res, 200, out);
+}
+
 // ---------- Server ----------
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, PUBLIC_URL);
     const p = url.pathname;
     if (p === '/healthz') return send(res, 200, { ok: true });
+    if (p === '/mcp') return await handleMcp(req, res);
     if (p === '/auth/login') return loginStart(res);
     if (p === '/auth/callback') return await loginCallback(req, res, url);
     if (p === '/auth/dev' && DEV_LOGIN) { const u = url.searchParams.get('u'); if (isUser(u)) return redirect(res, '/', { 'Set-Cookie': cookie('flechte_session', makeSession(u), 86400) }); }

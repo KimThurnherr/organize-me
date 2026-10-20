@@ -1,8 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let S = null, tab = 'home', pending = null, editing = null, selected = new Set(), busy = false;
-let weekOffset = null, mealsDirty = false, mealsKey = '', chat = [];
-try { chat = JSON.parse(sessionStorage.getItem('flechte_chat') || '[]'); } catch {}
+let weekOffset = null, mealsDirty = false, mealsKey = '';
 const NAME = k => S?.users.find(u => u.key === k)?.name || k || '';
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const dayNum = s => { const [y, m, d] = s.split('-').map(Number); return Date.UTC(y, m - 1, d) / 864e5; };
@@ -36,7 +35,6 @@ async function load() {
   try { S = await call('GET', 'state'); } catch { return; }
   $('login').hidden = true; $('app').hidden = false;
   $('whoami').textContent = NAME(S.me);
-  $('tabAsk').hidden = !S.aiEnabled; if (!S.aiEnabled && tab === 'ask') tab = 'home';
   render(); updatePushUi();
 }
 function showLogin() {
@@ -187,7 +185,7 @@ function renderMeals() {
   const meal = S.meals.find(m => m.date === S.today);
   const mt = $('mealToday');
   mt.className = 'meal-today' + (meal ? '' : ' none');
-  mt.textContent = meal ? meal.title + (meal.note ? ' (' + meal.note + ')' : '') : 'Noch nichts geplant. Unter «Fragen» kannst du dir etwas vorschlagen lassen.';
+  mt.textContent = meal ? meal.title + (meal.note ? ' (' + meal.note + ')' : '') : 'Noch nichts geplant.';
   const nextPlanned = S.meals.filter(m => dayNum(m.date) > todayN && dayNum(m.date) <= todayN + 7).length;
   const ph = $('planHint');
   ph.hidden = !(isSunday && nextPlanned < 5);
@@ -255,34 +253,6 @@ $('mealForm').addEventListener('submit', async e => {
   toast(pts ? 'Plan gespeichert, +' + pts + ' Punkte fürs Team' : 'Plan gespeichert');
   await load();
 });
-
-// Fragen
-function renderChat() {
-  const c = $('chat'); c.innerHTML = '';
-  if (!chat.length) { const p = document.createElement('p'); p.className = 'empty'; p.textContent = 'Noch keine Fragen gestellt.'; c.appendChild(p); }
-  for (const m of chat) {
-    const d = document.createElement('div'); d.className = 'msg ' + m.role; d.textContent = m.content;
-    if (m.actions?.length) { const a = document.createElement('div'); a.className = 'acts'; a.textContent = 'Eingetragen: ' + m.actions.join(', '); d.appendChild(a); }
-    c.appendChild(d);
-  }
-  c.scrollTop = c.scrollHeight;
-  try { sessionStorage.setItem('flechte_chat', JSON.stringify(chat.slice(-30))); } catch {}
-}
-$('askForm').addEventListener('submit', async e => {
-  e.preventDefault();
-  const q = $('askInput').value.trim(); if (!q) return;
-  chat.push({ role: 'user', content: q }); $('askInput').value = ''; renderChat();
-  const btn = $('askBtn'); btn.disabled = true; btn.textContent = 'Denke nach …';
-  try {
-    const d = await call('POST', 'ai', { messages: chat.map(m => ({ role: m.role, content: m.content })) });
-    chat.push({ role: 'assistant', content: d.reply, actions: d.actions });
-    if (d.actions?.length) { mealsKey = ''; await load(); }
-  } catch (err) { chat.push({ role: 'assistant', content: err.message }); }
-  btn.disabled = false; btn.textContent = 'Fragen'; renderChat();
-});
-$('askInput').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('askForm').requestSubmit(); });
-$('askClear').addEventListener('click', () => { chat = []; renderChat(); });
-renderChat();
 
 // Push
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
