@@ -29,11 +29,8 @@ services:
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8080}:8080"
     volumes:
-      - flechte-data:/home/node/data
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
+      # Volume auf /home/node (gehört dem User node), damit die App ins Datenverzeichnis schreiben darf
+      - flechte-home:/home/node
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
       interval: 30s
@@ -42,4 +39,4 @@ services:
       start_period: 30s
 
 volumes:
-  flechte-data:
+  flechte-home:
