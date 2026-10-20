@@ -46,8 +46,8 @@ function showLogin() {
 }
 
 function choreState(c) {
-  if (!c.last_done) return { due: true, over: 0, text: 'noch nie erledigt', cls: 'warn' };
-  const left = c.interval_days - daysSince(c.last_done);
+  if (!c.last_done && !c.due_override) return { due: true, over: 0, text: 'noch nie erledigt', cls: 'warn' };
+  const left = c.due_override ? dayNum(c.due_override) - dayNum(S.today) : c.interval_days - daysSince(c.last_done);
   if (left > 0) return { due: false, over: 0, text: left === 1 ? 'fällig morgen' : 'fällig in ' + left + ' Tagen', cls: 'ok' };
   if (left === 0) return { due: true, over: 0, text: 'heute fällig', cls: 'warn' };
   return { due: true, over: -left, text: 'seit ' + (-left) + (left === -1 ? ' Tag' : ' Tagen') + ' überfällig', cls: 'bad' };

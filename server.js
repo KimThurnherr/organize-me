@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS guest_reminders (guest_id INTEGER NOT NULL, user TEXT
 CREATE TABLE IF NOT EXISTS meals (date TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT, updated_by TEXT, updated_at TEXT);
 `);
 const q = (sql) => db.prepare(sql);
+try { db.exec('ALTER TABLE chores ADD COLUMN due_override TEXT'); } catch { /* Spalte existiert schon */ }
 const meta = {
   get: (k, d) => { const r = q('SELECT v FROM meta WHERE k=?').get(k); return r ? r.v : d; },
   set: (k, v) => q('INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v').run(k, String(v)),
@@ -100,6 +101,8 @@ const dayNum = s => { const [y, m, d] = s.split('-').map(Number); return Date.UT
 const daysSince = s => dayNum(localNow().date) - dayNum(s);
 const weekStart = s => { const n = dayNum(s); return n - ((new Date(n * 864e5).getUTCDay() + 6) % 7); };
 const dateStr = n => new Date(n * 864e5).toISOString().slice(0, 10);
+// Tage bis zur Fälligkeit einer Haushaltsaufgabe (0 = heute, negativ = überfällig)
+const choreDueIn = c => c.due_override ? dayNum(c.due_override) - dayNum(localNow().date) : (c.last_done ? c.interval_days - (dayNum(localNow().date) - dayNum(c.last_done)) : 0);
 const isDate = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(dayNum(s));
 const isTime = s => typeof s === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
 
@@ -217,14 +220,16 @@ const ops = {
     const pts = b.points !== undefined ? int(b.points, 1, 100) : c.points;
     const as = b.assignee !== undefined ? str(b.assignee, 20) : c.assignee;
     if (!name || !iv || !pts || !isUser(as)) fail(400, 'Ungültige Angaben');
-    q('UPDATE chores SET name=?, interval_days=?, points=?, assignee=? WHERE id=?').run(name, iv, pts, as, c.id);
+    let due = c.due_override;
+    if (b.next_due !== undefined) { const d = b.next_due === null ? '' : str(b.next_due, 10); if (d && !isDate(d)) fail(400, 'Ungültiges Datum (YYYY-MM-DD)'); due = d || null; }
+    q('UPDATE chores SET name=?, interval_days=?, points=?, assignee=?, due_override=? WHERE id=?').run(name, iv, pts, as, due, c.id);
     return { ok: true };
   },
   choreDelete(id) { const c = ops.choreGet(id); q('DELETE FROM chores WHERE id=?').run(c.id); return { ok: true }; },
   choreDone(user, id) {
     const c = ops.choreGet(id), today = localNow().date;
     if (c.last_done === today && c.last_by) fail(409, 'Heute schon erledigt');
-    q('UPDATE chores SET last_done=?, last_by=? WHERE id=?').run(today, user, c.id);
+    q('UPDATE chores SET last_done=?, last_by=?, due_override=NULL WHERE id=?').run(today, user, c.id);
     addLog(user, c.points, 'chore', c.name, c.id);
     return { ok: true, points: c.points };
   },
@@ -241,6 +246,17 @@ const ops = {
     const t = ops.todoGet(id);
     if (done && !t.done) { q('UPDATE todos SET done=1, done_by=?, done_at=? WHERE id=?').run(user, nowIso(), t.id); addLog(user, 5, 'todo', t.title, t.id); return { ok: true, points: 5 }; }
     if (!done && t.done) { q('UPDATE todos SET done=0, done_by=NULL, done_at=NULL WHERE id=?').run(t.id); q("DELETE FROM log WHERE type='todo' AND ref=?").run(String(t.id)); }
+    return { ok: true };
+  },
+  todoUpdate(id, b) {
+    const t = ops.todoGet(id);
+    const title = b.title !== undefined ? str(b.title, 140) : t.title;
+    const due = b.due !== undefined ? (b.due === null ? '' : str(b.due, 10)) : (t.due || '');
+    const as = b.assignee !== undefined ? (b.assignee === null ? '' : str(b.assignee, 20)) : (t.assignee || '');
+    if (!title) fail(400, 'Titel darf nicht leer sein');
+    if (due && !isDate(due)) fail(400, 'Ungültiges Datum (YYYY-MM-DD)');
+    if (as && !isUser(as)) fail(400, 'Ungültige Person');
+    q('UPDATE todos SET title=?, due=?, assignee=? WHERE id=?').run(title, due || null, as || null, t.id);
     return { ok: true };
   },
   todoDelete(id) { const t = ops.todoGet(id); q('DELETE FROM todos WHERE id=?').run(t.id); q("DELETE FROM log WHERE type='todo' AND ref=?").run(String(t.id)); return { ok: true }; },
@@ -284,6 +300,7 @@ async function api(req, res, user, route) {
     if ((mm = route.match(/^chores\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.choreUpdate(mm[1], body));
     if ((mm = route.match(/^chores\/(\d+)\/done$/)) && m === 'POST') return send(res, 200, ops.choreDone(user, mm[1]));
     if (m === 'POST' && route === 'todos') return send(res, 200, ops.todoAdd(user, body));
+    if ((mm = route.match(/^todos\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.todoUpdate(mm[1], body));
     if ((mm = route.match(/^todos\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.todoDelete(mm[1]));
     if ((mm = route.match(/^todos\/(\d+)\/toggle$/)) && m === 'POST') return send(res, 200, ops.todoSetDone(user, mm[1], !ops.todoGet(mm[1]).done));
     if (m === 'POST' && route === 'meals') return send(res, 200, ops.mealSet(user, body.date, body.title, body.note));
@@ -369,7 +386,7 @@ async function pushToUser(user, data) {
 // Was ist für diese Person fällig?
 function dueFor(user) {
   const today = localNow().date;
-  const chores = q('SELECT * FROM chores WHERE assignee=?').all(user).filter(c => !c.last_done || daysSince(c.last_done) >= c.interval_days);
+  const chores = q('SELECT * FROM chores WHERE assignee=?').all(user).filter(c => choreDueIn(c) <= 0);
   const todos = q('SELECT * FROM todos WHERE done=0 AND due IS NOT NULL AND due <= ? AND (assignee IS NULL OR assignee=?)').all(today, user);
   const lastVisit = q('SELECT date FROM visits ORDER BY date DESC LIMIT 1').get()?.date;
   const guestDays = lastVisit ? daysSince(lastVisit) : null;
@@ -483,7 +500,7 @@ const wdOf = d => WD[new Date(dayNum(d) * 864e5).getUTCDay()];
 const nameOf = u => USER_NAMES[u] || (u ? u.charAt(0).toUpperCase() + u.slice(1) : '');
 function choreView(c) {
   const today = localNow().date;
-  const left = c.last_done ? c.interval_days - (dayNum(today) - dayNum(c.last_done)) : 0;
+  const left = choreDueIn(c);
   return { id: c.id, name: c.name, assignee: c.assignee, interval_days: c.interval_days, points: c.points, last_done: c.last_by ? c.last_done : null, last_done_by: c.last_by || null, due_in_days: left, due_date: dateStr(dayNum(today) + Math.max(left, 0)), overdue: left < 0 };
 }
 function overview() {
@@ -508,12 +525,13 @@ const MCP_TOOLS = [
   { name: 'get_overview', description: 'Überblick: heutiges Datum, Personen, Teamziel der Woche, fällige Haushaltsaufgaben, offene To-dos, Essensplan dieser und nächster Woche, Gäste-Status. Zuerst aufrufen, um den Kontext zu kennen.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => overview() },
   { name: 'list_chores', description: 'Alle wiederkehrenden Haushaltsaufgaben mit Person, Intervall, Punkten und Fälligkeit.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => q('SELECT * FROM chores ORDER BY name').all().map(choreView) },
   { name: 'add_chore', description: 'Neue wiederkehrende Haushaltsaufgabe anlegen.', inputSchema: { type: 'object', properties: { name: P('string', 'Bezeichnung'), interval_days: P('integer', 'Alle wie viele Tage (1-365)'), points: P('integer', 'Punkte fürs Teamziel (1-100), Standard 10'), assignee: P('string', 'Schlüssel der zuständigen Person (siehe get_overview.people)') }, required: ['name', 'interval_days', 'assignee'] }, run: (u, a) => ops.choreAdd(u, a) },
-  { name: 'update_chore', description: 'Haushaltsaufgabe ändern (nur angegebene Felder).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), name: P('string', 'Neue Bezeichnung'), interval_days: P('integer', 'Neues Intervall in Tagen'), points: P('integer', 'Neue Punkte'), assignee: P('string', 'Neue zuständige Person') }, required: ['id'] }, run: (u, a) => ops.choreUpdate(a.id, a) },
+  { name: 'update_chore', description: 'Haushaltsaufgabe ändern (nur angegebene Felder), auch die nächste Fälligkeit verschieben.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), name: P('string', 'Neue Bezeichnung'), interval_days: P('integer', 'Neues Intervall in Tagen'), points: P('integer', 'Neue Punkte'), assignee: P('string', 'Neue zuständige Person'), next_due: P('string', 'Nächste Fälligkeit YYYY-MM-DD setzen (gilt bis zur nächsten Erledigung, danach wieder nach Intervall). Leerer String entfernt die manuelle Fälligkeit.') }, required: ['id'] }, run: (u, a) => ops.choreUpdate(a.id, a) },
   { name: 'delete_chore', description: 'Haushaltsaufgabe löschen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe') }, required: ['id'] }, destructive: true, run: (u, a) => ops.choreDelete(a.id) },
   { name: 'complete_chore', description: 'Haushaltsaufgabe als heute erledigt markieren (zählt fürs Teamziel, im Namen der verbundenen Person).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), person: { ...PERSON, description: 'Wer hat es erledigt. Ohne Angabe zählt es für die zuständige Person.' } }, required: ['id'] }, run: (u, a) => ops.choreDone(actor(u, a, ops.choreGet(a.id).assignee), a.id) },
   { name: 'list_todos', description: 'To-dos auflisten.', inputSchema: { type: 'object', properties: { include_done: P('boolean', 'Auch erledigte der letzten 30 Tage') } }, readOnly: true, run: (u, a) => q('SELECT id, title, due, assignee, done, done_by, done_at FROM todos WHERE done=0 OR (? AND done_at >= ?) ORDER BY done, COALESCE(due, \'9999\'), id').all(a.include_done ? 1 : 0, new Date(Date.now() - 30 * 864e5).toISOString()) },
   { name: 'add_todo', description: 'Einmaliges To-do anlegen, z.B. Einkauf oder Erledigung.', inputSchema: { type: 'object', properties: { title: P('string', 'Was ist zu tun'), due: P('string', 'Fällig bis YYYY-MM-DD (optional)'), assignee: P('string', 'Schlüssel der Person, leer = beide'), person: PERSON }, required: ['title'] }, run: (u, a) => ops.todoAdd(actor(u, a, Object.keys(USERS)[0]), a) },
   { name: 'set_todo_done', description: 'To-do als erledigt oder wieder offen markieren.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID des To-dos'), done: P('boolean', 'true = erledigt, false = wieder offen'), person: { ...PERSON, description: 'Wer hat es erledigt. Ohne Angabe zählt es für die eingetragene Person, bei To-dos für beide muss sie angegeben werden.' } }, required: ['id', 'done'] }, run: (u, a) => ops.todoSetDone(actor(u, a, ops.todoGet(a.id).assignee), a.id, !!a.done) },
+  { name: 'update_todo', description: 'To-do ändern: Titel, Fälligkeitsdatum oder Person (nur angegebene Felder).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID des To-dos'), title: P('string', 'Neuer Titel'), due: P('string', 'Fällig bis YYYY-MM-DD, leerer String entfernt das Datum'), assignee: P('string', 'Schlüssel der Person, leerer String = beide') }, required: ['id'] }, run: (u, a) => ops.todoUpdate(a.id, a) },
   { name: 'delete_todo', description: 'To-do löschen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID des To-dos') }, required: ['id'] }, destructive: true, run: (u, a) => ops.todoDelete(a.id) },
   { name: 'get_meal_plan', description: 'Essensplan für einen Zeitraum lesen, plus die am häufigsten gekochten Gerichte.', inputSchema: { type: 'object', properties: { from: P('string', 'YYYY-MM-DD, Standard Montag dieser Woche'), to: P('string', 'YYYY-MM-DD, Standard Sonntag nächster Woche') } }, readOnly: true, run: (u, a) => {
       const ws = weekStart(localNow().date), from = isDate(a.from) ? a.from : dateStr(ws), to = isDate(a.to) ? a.to : dateStr(ws + 13);
