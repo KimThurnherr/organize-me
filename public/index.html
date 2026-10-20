@@ -34,6 +34,7 @@
     <nav class="tabs" role="tablist">
       <button class="tab" role="tab" data-tab="home">Heute<span class="badge" id="badgeHome" hidden></span></button>
       <button class="tab" role="tab" data-tab="chores">Haushalt</button>
+      <button class="tab" role="tab" data-tab="health">Gesundheit<span class="badge" id="badgeHealth" hidden></span></button>
       <button class="tab" role="tab" data-tab="meals">Essen</button>
       <button class="tab" role="tab" data-tab="todos">To-dos</button>
       <button class="tab" role="tab" data-tab="guests">Gäste</button>
@@ -63,6 +64,10 @@
         <h2>Für dich fällig</h2>
         <ul class="list" id="myDue"></ul>
       </div>
+      <div class="card" id="healthHomeCard">
+        <div class="goal-head"><h2>Gesundheit heute</h2><button class="link" type="button" id="toHealth">Statistik</button></div>
+        <ul class="checks" id="healthHome"></ul>
+      </div>
       <div class="card">
         <h2>Gäste</h2>
         <div class="big small-big" id="guestBig">–</div>
@@ -79,6 +84,14 @@
     <section data-panel="chores" class="panel" hidden>
       <div><h2>Haushalt</h2><p class="hint">Jede Aufgabe hat eine feste Person. Erledigt antippen zählt fürs Teamziel.</p></div>
       <div class="card"><ul class="list" id="choreList"></ul></div>
+      <div class="card">
+        <div class="goal-head"><h2>Verlauf &amp; Statistik</h2>
+          <div class="monthnav"><button class="link" type="button" id="cmPrev" aria-label="Vorheriger Monat">‹</button><strong id="cmLabel"></strong><button class="link" type="button" id="cmNext" aria-label="Nächster Monat">›</button></div>
+        </div>
+        <div class="statrow" id="choreSummary"></div>
+        <div class="tablewrap"><table class="stats" id="choreStats"></table></div>
+        <details><summary>Alle Erledigungen im Monat</summary><ul class="list" id="choreHistory"></ul></details>
+      </div>
       <form class="card" id="choreForm">
         <h2>Aufgabe hinzufügen</h2>
         <label for="cName">Aufgabe<input type="text" id="cName" maxlength="80" required></label>
@@ -89,6 +102,35 @@
         </div>
         <div><button class="ghost" type="submit">Hinzufügen</button></div>
       </form>
+    </section>
+
+    <!-- Gesundheit -->
+    <section data-panel="health" class="panel" hidden>
+      <div><h2>Gesundheit</h2><p class="hint">Tägliche Checkliste. Jede Person hakt für sich ab, nachtragen geht bis 60 Tage zurück.</p></div>
+      <div class="card">
+        <div class="goal-head">
+          <div class="monthnav"><button class="link" type="button" id="hdPrev" aria-label="Vorheriger Tag">‹</button><strong id="hdLabel"></strong><button class="link" type="button" id="hdNext" aria-label="Nächster Tag">›</button></div>
+          <span class="pill" id="hdPill"></span>
+        </div>
+        <ul class="checks" id="healthDay"></ul>
+      </div>
+      <div class="card">
+        <div class="goal-head"><h2>Monatsstatistik</h2>
+          <div class="monthnav"><button class="link" type="button" id="hmPrev" aria-label="Vorheriger Monat">‹</button><strong id="hmLabel"></strong><button class="link" type="button" id="hmNext" aria-label="Nächster Monat">›</button></div>
+        </div>
+        <div class="chips" id="hsPeople"></div>
+        <div class="statrow" id="healthSummary"></div>
+        <div id="healthStats"></div>
+      </div>
+      <div class="card">
+        <h2>Checkliste anpassen</h2>
+        <ul class="list" id="healthItems"></ul>
+        <form id="healthItemForm" class="row">
+          <label class="grow" for="hiName">Neuer Punkt<input type="text" id="hiName" maxlength="80" required placeholder="z.B. 2 Liter Wasser"></label>
+          <label for="hiWho" style="flex:0 1 140px">Für<select id="hiWho"></select></label>
+          <button class="ghost" type="submit">Hinzufügen</button>
+        </form>
+      </div>
     </section>
 
     <!-- Essen -->

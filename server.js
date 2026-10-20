@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS subs (endpoint TEXT PRIMARY KEY, user TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS user_settings (user TEXT PRIMARY KEY, morning TEXT NOT NULL DEFAULT '09:00', evening TEXT NOT NULL DEFAULT '18:00');
 CREATE TABLE IF NOT EXISTS push_sent (user TEXT, slot TEXT, date TEXT, PRIMARY KEY (user, slot, date));
 CREATE TABLE IF NOT EXISTS guest_reminders (guest_id INTEGER NOT NULL, user TEXT NOT NULL, date TEXT NOT NULL, PRIMARY KEY (guest_id, user));
+CREATE TABLE IF NOT EXISTS health_items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, person TEXT, active INTEGER NOT NULL DEFAULT 1, created_at TEXT);
+CREATE TABLE IF NOT EXISTS health_checks (item_id INTEGER NOT NULL, user TEXT NOT NULL, date TEXT NOT NULL, at TEXT, PRIMARY KEY (item_id, user, date));
 CREATE TABLE IF NOT EXISTS meals (date TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT, updated_by TEXT, updated_at TEXT);
 `);
 const q = (sql) => db.prepare(sql);
@@ -92,6 +94,12 @@ if (meta.get('seeded') !== '1' && Object.keys(USERS).length) {
   for (const [n, iv, p, who] of seed) ins.run(n, iv, p, keys[who] || keys[0], new Date().toISOString());
   meta.set('team_goal', 120);
   meta.set('seeded', '1');
+}
+
+if (meta.get('health_seeded') !== '1') {
+  const ins = q('INSERT INTO health_items(name,person,created_at) VALUES(?,?,?)');
+  for (const n of ['Grüner Shake', 'Nahrungsergänzungsmittel']) ins.run(n, null, new Date().toISOString());
+  meta.set('health_seeded', '1');
 }
 
 // ---------- Datum (lokal in TZ) ----------
@@ -191,6 +199,7 @@ function state(user) {
     log: q('SELECT by, points, type, date FROM log WHERE date >= ? ORDER BY date').all(new Date(Date.now() - 400 * 864e5).toISOString().slice(0, 10)),
     totalPoints: q('SELECT COALESCE(SUM(points),0) AS s FROM log').get().s,
     meals: q('SELECT date, title, note FROM meals WHERE date >= ? AND date <= ? ORDER BY date').all(dateStr(weekStart(localNow().date) - 7), dateStr(weekStart(localNow().date) + 13)),
+    healthToday: healthDay(user),
     longAbsent: longAbsentGuests(),
     guestRemindDays: GUEST_REMIND_DAYS,
     mealIdeas: q('SELECT title, COUNT(*) AS n FROM meals GROUP BY lower(title) ORDER BY n DESC, max(date) DESC LIMIT 60').all().map(r => r.title),
@@ -228,12 +237,25 @@ const ops = {
     return { ok: true };
   },
   choreDelete(id) { const c = ops.choreGet(id); q('DELETE FROM chores WHERE id=?').run(c.id); return { ok: true }; },
-  choreDone(user, id) {
+  choreDone(user, id, date) {
     const c = ops.choreGet(id), today = localNow().date;
-    if (c.last_done === today && c.last_by) fail(409, 'Heute schon erledigt');
-    q('UPDATE chores SET last_done=?, last_by=?, due_override=NULL WHERE id=?').run(today, user, c.id);
-    addLog(user, c.points, 'chore', c.name, c.id);
-    return { ok: true, points: c.points };
+    const d = date ? str(date, 10) : today;
+    if (!isDate(d) || d > today || dayNum(today) - dayNum(d) > 60) fail(400, 'Ungültiges Datum (nicht in der Zukunft, höchstens 60 Tage zurück)');
+    if (q("SELECT 1 FROM log WHERE type='chore' AND ref=? AND date=?").get(String(c.id), d)) fail(409, d === today ? 'Heute schon erledigt' : 'An diesem Tag schon erledigt');
+    if (!c.last_by || !c.last_done || d >= c.last_done) q('UPDATE chores SET last_done=?, last_by=?, due_override=NULL WHERE id=?').run(d, user, c.id);
+    addLog(user, c.points, 'chore', c.name, c.id, d);
+    return { ok: true, points: c.points, date: d };
+  },
+  choreCompletionDelete(logId) {
+    const l = q("SELECT * FROM log WHERE id=? AND type='chore'").get(+logId);
+    if (!l) fail(404, 'Eintrag nicht gefunden');
+    q('DELETE FROM log WHERE id=?').run(l.id);
+    const c = q('SELECT * FROM chores WHERE id=?').get(+l.ref);
+    if (c && c.last_by && c.last_done === l.date) {
+      const prev = q("SELECT by, date FROM log WHERE type='chore' AND ref=? ORDER BY date DESC, id DESC LIMIT 1").get(String(c.id));
+      q('UPDATE chores SET last_done=?, last_by=? WHERE id=?').run(prev?.date || null, prev?.by || null, c.id);
+    }
+    return { ok: true };
   },
   todoAdd(user, b) {
     const title = str(b.title, 140), due = b.due ? str(b.due, 10) : '', as = b.assignee ? str(b.assignee, 20) : '';
@@ -278,6 +300,33 @@ const ops = {
     return { ok: true, id: vid, points: 10 };
   },
   visitDelete(id) { if (!q('SELECT 1 FROM visits WHERE id=?').get(+id)) fail(404, 'Besuch nicht gefunden'); q('DELETE FROM visits WHERE id=?').run(+id); q("DELETE FROM log WHERE type='visit' AND ref=?").run(String(+id)); return { ok: true }; },
+  healthItemGet(id) { const h = q('SELECT * FROM health_items WHERE id=?').get(+id); if (!h) fail(404, 'Eintrag nicht gefunden'); return h; },
+  healthItemAdd(b) {
+    const name = str(b.name, 80), person = b.person ? str(b.person, 20).toLowerCase() : '';
+    if (!name) fail(400, 'Bitte einen Namen angeben.');
+    if (person && !isUser(person)) fail(400, 'Ungültige Person');
+    const r = q('INSERT INTO health_items(name,person,created_at) VALUES(?,?,?)').run(name, person || null, nowIso());
+    return { ok: true, id: Number(r.lastInsertRowid) };
+  },
+  healthItemUpdate(id, b) {
+    const h = ops.healthItemGet(id);
+    const name = b.name !== undefined ? str(b.name, 80) : h.name;
+    const person = b.person !== undefined ? (b.person ? str(b.person, 20).toLowerCase() : '') : (h.person || '');
+    const active = b.active !== undefined ? (b.active ? 1 : 0) : h.active;
+    if (!name) fail(400, 'Name darf nicht leer sein');
+    if (person && !isUser(person)) fail(400, 'Ungültige Person');
+    q('UPDATE health_items SET name=?, person=?, active=? WHERE id=?').run(name, person || null, active, h.id);
+    return { ok: true };
+  },
+  healthItemDelete(id) { const h = ops.healthItemGet(id); q('DELETE FROM health_checks WHERE item_id=?').run(h.id); q('DELETE FROM health_items WHERE id=?').run(h.id); return { ok: true }; },
+  healthCheck(user, itemId, date, done) {
+    const h = ops.healthItemGet(itemId), today = localNow().date, d = date ? str(date, 10) : today;
+    if (!isDate(d) || d > today || dayNum(today) - dayNum(d) > 60) fail(400, 'Ungültiges Datum (nicht in der Zukunft, höchstens 60 Tage zurück)');
+    if (h.person && h.person !== user) fail(400, `«${h.name}» gilt nur für ${nameOf(h.person)}`);
+    if (done) q('INSERT OR IGNORE INTO health_checks(item_id,user,date,at) VALUES(?,?,?,?)').run(h.id, user, d, nowIso());
+    else q('DELETE FROM health_checks WHERE item_id=? AND user=? AND date=?').run(h.id, user, d);
+    return { ok: true, date: d, done: !!done };
+  },
   settingsSet(user, b) {
     const cur = q('SELECT morning, evening FROM user_settings WHERE user=?').get(user) || { morning: '09:00', evening: '18:00' };
     const mo = b.morning !== undefined ? str(b.morning, 5) : cur.morning, ev = b.evening !== undefined ? str(b.evening, 5) : cur.evening;
@@ -288,19 +337,95 @@ const ops = {
   },
 };
 
+// ---------- Gesundheit & Statistik ----------
+const nameOf = u => USER_NAMES[u] || (u ? u.charAt(0).toUpperCase() + u.slice(1) : '');
+const monthOf = m => /^\d{4}-(0[1-9]|1[0-2])$/.test(m || '') ? m : localNow().date.slice(0, 7);
+function monthRange(m) {
+  const [y, mo] = m.split('-').map(Number), first = `${m}-01`;
+  const last = dateStr(dayNum(first) + new Date(Date.UTC(y, mo, 0)).getUTCDate() - 1);
+  const today = localNow().date;
+  return { first, last, end: last < today ? last : today };
+}
+const healthItemsFor = (user, all) => q(`SELECT * FROM health_items WHERE (person IS NULL OR person=?)${all ? '' : ' AND active=1'} ORDER BY id`).all(user);
+function healthDay(user, date) {
+  const d = isDate(date) ? date : localNow().date;
+  const done = new Set(q('SELECT item_id FROM health_checks WHERE user=? AND date=?').all(user, d).map(r => r.item_id));
+  return { person: user, date: d, items: healthItemsFor(user).map(h => ({ id: h.id, name: h.name, only_for: h.person, done: done.has(h.id) })) };
+}
+function healthStreak(itemId, user) {
+  const set = new Set(q('SELECT date FROM health_checks WHERE item_id=? AND user=? ORDER BY date DESC LIMIT 400').all(itemId, user).map(r => r.date));
+  let n = dayNum(localNow().date); if (!set.has(dateStr(n))) n--;
+  let streak = 0; while (set.has(dateStr(n))) { streak++; n--; }
+  return streak;
+}
+function healthStats(user, month) {
+  const m = monthOf(month), { first, end } = monthRange(m);
+  const items = healthItemsFor(user, true).filter(h => h.active || q('SELECT 1 FROM health_checks WHERE item_id=? AND user=? AND date BETWEEN ? AND ?').get(h.id, user, first, end));
+  const rows = items.map(h => {
+    const earliest = q('SELECT min(date) AS d FROM health_checks WHERE item_id=? AND user=?').get(h.id, user)?.d;
+    let created = (h.created_at || first).slice(0, 10); if (earliest && earliest < created) created = earliest;
+    const start = created > first ? created : first;
+    const possible = end >= start ? dayNum(end) - dayNum(start) + 1 : 0;
+    const dates = q('SELECT date FROM health_checks WHERE item_id=? AND user=? AND date BETWEEN ? AND ? ORDER BY date').all(h.id, user, first, end).map(r => r.date);
+    return { id: h.id, name: h.name, active: !!h.active, since: start, done_days: dates.length, possible_days: possible, percent: possible ? Math.round(dates.length / possible * 100) : 0, streak: healthStreak(h.id, user), dates };
+  });
+  let full = 0;
+  if (end >= first) for (let n = dayNum(rows.length ? rows.map(r => r.since).sort()[0] : first); n <= dayNum(end); n++) {
+    const d = dateStr(n), need = rows.filter(r => r.active && r.since <= d);
+    if (need.length && need.every(r => r.dates.includes(d))) full++;
+  }
+  const since = rows.length ? rows.map(r => r.since).sort()[0] : first;
+  return { person: user, month: m, days: end >= since ? dayNum(end) - dayNum(since) + 1 : 0, complete_days: full, items: rows };
+}
+function choreHistory(month, choreId) {
+  const { first, last } = monthRange(monthOf(month));
+  return q(`SELECT l.id AS log_id, l.date, l.by, l.points, CAST(l.ref AS INTEGER) AS chore_id, COALESCE(c.name, l.label) AS name FROM log l LEFT JOIN chores c ON c.id = CAST(l.ref AS INTEGER) WHERE l.type='chore' AND l.date BETWEEN ? AND ?${choreId ? ' AND l.ref=?' : ''} ORDER BY l.date DESC, l.id DESC`).all(...(choreId ? [first, last, String(+choreId)] : [first, last]));
+}
+function choreStats(month) {
+  const m = monthOf(month), { first, last } = monthRange(m);
+  const all = q("SELECT by, date, ref FROM log WHERE type='chore' ORDER BY date, id").all();
+  const byRef = new Map(); for (const e of all) { if (!byRef.has(e.ref)) byRef.set(e.ref, []); byRef.get(e.ref).push(e); }
+  const people = Object.fromEntries(Object.keys(USERS).map(k => [k, 0]));
+  let total = 0, onTime = 0, rated = 0;
+  const chores = q('SELECT * FROM chores ORDER BY name').all().map(c => {
+    const list = byRef.get(String(c.id)) || [], perPerson = Object.fromEntries(Object.keys(USERS).map(k => [k, 0]));
+    let count = 0, gaps = [], ok = 0, late = 0, maxLate = 0;
+    list.forEach((e, i) => {
+      if (e.date < first || e.date > last) return;
+      count++; if (perPerson[e.by] !== undefined) perPerson[e.by]++;
+      if (i > 0) { const gap = dayNum(e.date) - dayNum(list[i - 1].date); gaps.push(gap); if (gap <= c.interval_days) ok++; else { late++; maxLate = Math.max(maxLate, gap - c.interval_days); } }
+    });
+    total += count; onTime += ok; rated += ok + late;
+    for (const k in perPerson) people[k] += perPerson[k];
+    const created = (c.created_at || first).slice(0, 10), firstLog = list[0]?.date;
+    let since = created; if (firstLog && firstLog < since) since = firstLog; if (since < first) since = first;
+    const daysInRange = Math.max(0, dayNum(monthRange(m).end) - dayNum(since) + 1);
+    return { id: c.id, name: c.name, assignee: c.assignee, interval_days: c.interval_days, count, expected: Math.max(0, Math.round(daysInRange / c.interval_days)), by_person: perPerson, avg_gap_days: gaps.length ? Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length * 10) / 10 : null, on_time: ok, late, max_days_late: maxLate };
+  });
+  return { month: m, total, by_person: people, on_time_percent: rated ? Math.round(onTime / rated * 100) : null, chores };
+}
+
 // ---------- API ----------
 async function api(req, res, user, route) {
   const m = req.method;
   // CSRF: schreibende Requests nur mit eigenem Header (SameSite=Lax + kein CORS)
   if (m !== 'GET' && req.headers['x-flechte'] !== '1') return send(res, 403, { error: 'csrf' });
   const body = m === 'GET' ? {} : await readBody(req);
+  const qs = new URL(req.url, 'http://x').searchParams;
   let mm;
   try {
     if (m === 'GET' && route === 'state') return send(res, 200, state(user));
     if (m === 'POST' && route === 'chores') return send(res, 200, ops.choreAdd(user, body));
     if ((mm = route.match(/^chores\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.choreDelete(mm[1]));
     if ((mm = route.match(/^chores\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.choreUpdate(mm[1], body));
-    if ((mm = route.match(/^chores\/(\d+)\/done$/)) && m === 'POST') return send(res, 200, ops.choreDone(user, mm[1]));
+    if ((mm = route.match(/^chores\/(\d+)\/done$/)) && m === 'POST') return send(res, 200, ops.choreDone(user, mm[1], body.date));
+    if (m === 'GET' && route === 'chores/history') return send(res, 200, { history: choreHistory(qs.get('month')), stats: choreStats(qs.get('month')) });
+    if ((mm = route.match(/^chores\/history\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.choreCompletionDelete(mm[1]));
+    if (m === 'GET' && route === 'health') return send(res, 200, { day: healthDay(user, qs.get('date')), stats: healthStats(isUser(qs.get('person')) ? qs.get('person') : user, qs.get('month')), items: q('SELECT * FROM health_items ORDER BY active DESC, id').all() });
+    if (m === 'POST' && route === 'health/check') return send(res, 200, ops.healthCheck(user, body.item_id, body.date, !!body.done));
+    if (m === 'POST' && route === 'health/items') return send(res, 200, ops.healthItemAdd(body));
+    if ((mm = route.match(/^health\/items\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.healthItemUpdate(mm[1], body));
+    if ((mm = route.match(/^health\/items\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.healthItemDelete(mm[1]));
     if (m === 'POST' && route === 'todos') return send(res, 200, ops.todoAdd(user, body));
     if ((mm = route.match(/^todos\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.todoUpdate(mm[1], body));
     if ((mm = route.match(/^todos\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.todoDelete(mm[1]));
@@ -405,7 +530,9 @@ function longAbsentGuests() {
 function buildMessage(user, slot) {
   const d = dueFor(user);
   const lines = [];
-  if (d.chores.length) lines.push((d.chores.length === 1 ? 'Fällig: ' : `${d.chores.length} Aufgaben fällig: `) + d.chores.slice(0, 4).map(c => c.name).join(', ') + (d.chores.length > 4 ? ' …' : ''));
+  const over = d.chores.filter(c => choreDueIn(c) < 0).sort((a, b) => choreDueIn(a) - choreDueIn(b)), dueToday = d.chores.filter(c => choreDueIn(c) === 0);
+  if (over.length) lines.push('Überfällig: ' + over.slice(0, 4).map(c => `${c.name} (${-choreDueIn(c)} ${-choreDueIn(c) === 1 ? 'Tag' : 'Tage'})`).join(', ') + (over.length > 4 ? ' …' : ''));
+  if (dueToday.length) lines.push('Heute fällig: ' + dueToday.slice(0, 4).map(c => c.name).join(', ') + (dueToday.length > 4 ? ' …' : ''));
   if (d.todos.length) lines.push((d.todos.length === 1 ? 'To-do: ' : `${d.todos.length} To-dos: `) + d.todos.slice(0, 3).map(t => t.title).join(', ') + (d.todos.length > 3 ? ' …' : ''));
   if (d.guestOverdue) lines.push(`Seit ${d.guestDays} Tagen kein Besuch. Wen ladet ihr ein?`);
   const today = localNow().date, dnum = dayNum(today);
@@ -415,6 +542,10 @@ function buildMessage(user, slot) {
       lines.push('Lange nicht gesehen: ' + due.slice(0, 4).map(g => `${g.name} (${g.last_visit ? 'seit ' + g.days + ' Tagen' : 'noch nie da'})`).join(', ') + (due.length > 4 ? ' …' : '') + '. Zeit für eine Einladung?');
       for (const g of due) q('INSERT INTO guest_reminders(guest_id,user,date) VALUES(?,?,?) ON CONFLICT(guest_id,user) DO UPDATE SET date=excluded.date').run(g.id, user, today);
     }
+  }
+  if (slot === 'evening') {
+    const open = healthDay(user, today).items.filter(i => !i.done);
+    if (open.length) lines.push('Gesundheit, noch offen: ' + open.map(i => i.name).join(', '));
   }
   const meal = q('SELECT title FROM meals WHERE date=?').get(today);
   if (slot === 'morning') lines.unshift(meal ? `Heute gibt es: ${meal.title}` : 'Für heute ist noch kein Essen geplant.');
@@ -499,7 +630,6 @@ function mcpUser(req) {
 }
 const WD = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
 const wdOf = d => WD[new Date(dayNum(d) * 864e5).getUTCDay()];
-const nameOf = u => USER_NAMES[u] || (u ? u.charAt(0).toUpperCase() + u.slice(1) : '');
 function choreView(c) {
   const today = localNow().date;
   const left = choreDueIn(c);
@@ -519,17 +649,18 @@ function overview() {
     due_chores: chores.filter(c => c.due_in_days <= 0),
     open_todos: q('SELECT id, title, due, assignee FROM todos WHERE done=0 ORDER BY COALESCE(due, \'9999\'), id').all(),
     meals: q('SELECT date, title, note FROM meals WHERE date >= ? AND date <= ? ORDER BY date').all(dateStr(ws), dateStr(ws + 13)).map(m => ({ ...m, weekday: wdOf(m.date) })),
+    health_today: Object.keys(USERS).map(k => healthDay(k, today)),
     guests: { last_visit: lastVisit, days_since: lastVisit ? dayNum(today) - dayNum(lastVisit) : null, goal: 'jede Woche jemand zu Gast', long_absent: longAbsentGuests(), long_absent_threshold_days: GUEST_REMIND_DAYS },
   };
 }
 const P = (type, description, extra = {}) => ({ type, description, ...extra });
 const MCP_TOOLS = [
-  { name: 'get_overview', description: 'Überblick: heutiges Datum, Personen, Teamziel der Woche, fällige Haushaltsaufgaben, offene To-dos, Essensplan dieser und nächster Woche, Gäste-Status. Zuerst aufrufen, um den Kontext zu kennen.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => overview() },
+  { name: 'get_overview', description: 'Überblick: heutiges Datum, Personen, Teamziel der Woche, fällige Haushaltsaufgaben, offene To-dos, Essensplan dieser und nächster Woche, Gäste-Status, Gesundheits-Checkliste heute. Zuerst aufrufen, um den Kontext zu kennen.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => overview() },
   { name: 'list_chores', description: 'Alle wiederkehrenden Haushaltsaufgaben mit Person, Intervall, Punkten und Fälligkeit.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => q('SELECT * FROM chores ORDER BY name').all().map(choreView) },
   { name: 'add_chore', description: 'Neue wiederkehrende Haushaltsaufgabe anlegen, optional mit erstem Fälligkeitsdatum.', inputSchema: { type: 'object', properties: { name: P('string', 'Bezeichnung'), interval_days: P('integer', 'Alle wie viele Tage (1-365)'), points: P('integer', 'Punkte fürs Teamziel (1-100), Standard 10'), assignee: P('string', 'Schlüssel der zuständigen Person (siehe get_overview.people)'), next_due: P('string', 'Erste Fälligkeit YYYY-MM-DD (optional, sonst sofort fällig)') }, required: ['name', 'interval_days', 'assignee'] }, run: (u, a) => ops.choreAdd(u, a) },
   { name: 'update_chore', description: 'Haushaltsaufgabe ändern (nur angegebene Felder), auch die nächste Fälligkeit verschieben.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), name: P('string', 'Neue Bezeichnung'), interval_days: P('integer', 'Neues Intervall in Tagen'), points: P('integer', 'Neue Punkte'), assignee: P('string', 'Neue zuständige Person'), next_due: P('string', 'Nächste Fälligkeit YYYY-MM-DD setzen (gilt bis zur nächsten Erledigung, danach wieder nach Intervall). Leerer String entfernt die manuelle Fälligkeit.') }, required: ['id'] }, run: (u, a) => ops.choreUpdate(a.id, a) },
   { name: 'delete_chore', description: 'Haushaltsaufgabe löschen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe') }, required: ['id'] }, destructive: true, run: (u, a) => ops.choreDelete(a.id) },
-  { name: 'complete_chore', description: 'Haushaltsaufgabe als heute erledigt markieren (zählt fürs Teamziel, im Namen der verbundenen Person).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), person: { ...PERSON, description: 'Wer hat es erledigt. Ohne Angabe zählt es für die zuständige Person.' } }, required: ['id'] }, run: (u, a) => ops.choreDone(actor(u, a, ops.choreGet(a.id).assignee), a.id) },
+  { name: 'complete_chore', description: 'Haushaltsaufgabe als erledigt markieren (heute oder an einem früheren Tag nachtragen). Zählt fürs Teamziel.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), person: { ...PERSON, description: 'Wer hat es erledigt. Ohne Angabe zählt es für die zuständige Person.' }, date: P('string', 'Erledigt am YYYY-MM-DD (optional, Standard heute, höchstens 60 Tage zurück)') }, required: ['id'] }, run: (u, a) => ops.choreDone(actor(u, a, ops.choreGet(a.id).assignee), a.id, a.date) },
   { name: 'list_todos', description: 'To-dos auflisten.', inputSchema: { type: 'object', properties: { include_done: P('boolean', 'Auch erledigte der letzten 30 Tage') } }, readOnly: true, run: (u, a) => q('SELECT id, title, due, assignee, done, done_by, done_at FROM todos WHERE done=0 OR (? AND done_at >= ?) ORDER BY done, COALESCE(due, \'9999\'), id').all(a.include_done ? 1 : 0, new Date(Date.now() - 30 * 864e5).toISOString()) },
   { name: 'add_todo', description: 'Einmaliges To-do anlegen, z.B. Einkauf oder Erledigung.', inputSchema: { type: 'object', properties: { title: P('string', 'Was ist zu tun'), due: P('string', 'Fällig bis YYYY-MM-DD (optional)'), assignee: P('string', 'Schlüssel der Person, leer = beide'), person: PERSON }, required: ['title'] }, run: (u, a) => ops.todoAdd(actor(u, a, Object.keys(USERS)[0]), a) },
   { name: 'set_todo_done', description: 'To-do als erledigt oder wieder offen markieren.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID des To-dos'), done: P('boolean', 'true = erledigt, false = wieder offen'), person: { ...PERSON, description: 'Wer hat es erledigt. Ohne Angabe zählt es für die eingetragene Person, bei To-dos für beide muss sie angegeben werden.' } }, required: ['id', 'done'] }, run: (u, a) => ops.todoSetDone(actor(u, a, ops.todoGet(a.id).assignee), a.id, !!a.done) },
@@ -555,8 +686,27 @@ const MCP_TOOLS = [
       if (a.morning === undefined && a.evening === undefined) { if (a.team_goal === undefined) fail(400, 'Nichts zu ändern'); const g = int(a.team_goal, 10, 2000); if (!g) fail(400, 'Ungültiges Teamziel (10-2000)'); meta.set('team_goal', g); return { ok: true }; }
       return ops.settingsSet(actor(u, a), { morning: a.morning, evening: a.evening, teamGoal: a.team_goal });
     } },
+  { name: 'get_chore_history', description: 'Verlauf: wann welche Haushaltsaufgabe von wem erledigt wurde, für einen Monat.', inputSchema: { type: 'object', properties: { month: P('string', 'YYYY-MM, Standard aktueller Monat'), chore_id: P('integer', 'Nur diese Aufgabe (optional)') } }, readOnly: true, run: (u, a) => ({ month: monthOf(a.month), entries: choreHistory(a.month, a.chore_id) }) },
+  { name: 'get_chore_stats', description: 'Monatsstatistik Haushalt: Anzahl Erledigungen pro Aufgabe und Person, erwartete Anzahl laut Intervall, durchschnittlicher Abstand, pünktlich/verspätet.', inputSchema: { type: 'object', properties: { month: P('string', 'YYYY-MM, Standard aktueller Monat') } }, readOnly: true, run: (u, a) => choreStats(a.month) },
+  { name: 'delete_chore_completion', description: 'Eine Erledigung aus dem Verlauf löschen (z.B. versehentlich abgehakt). Punkte werden zurückgenommen.', inputSchema: { type: 'object', properties: { log_id: P('integer', 'log_id aus get_chore_history') }, required: ['log_id'] }, destructive: true, run: (u, a) => ops.choreCompletionDelete(a.log_id) },
+  { name: 'list_health_items', description: 'Gesundheits-Checkliste: tägliche Punkte wie Grüner Shake oder Nahrungsergänzungsmittel. only_for leer = gilt für beide.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => q('SELECT id, name, person AS only_for, active FROM health_items ORDER BY active DESC, id').all() },
+  { name: 'add_health_item', description: 'Neuen täglichen Gesundheitspunkt anlegen.', inputSchema: { type: 'object', properties: { name: P('string', 'Bezeichnung'), only_for: P('string', 'Schlüssel einer Person, leer = für beide') }, required: ['name'] }, run: (u, a) => ops.healthItemAdd({ name: a.name, person: a.only_for }) },
+  { name: 'update_health_item', description: 'Gesundheitspunkt ändern oder pausieren (active=false blendet ihn aus, Statistik bleibt).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID'), name: P('string', 'Neue Bezeichnung'), only_for: P('string', 'Person, leerer String = für beide'), active: P('boolean', 'Aktiv') }, required: ['id'] }, run: (u, a) => ops.healthItemUpdate(a.id, { name: a.name, person: a.only_for, active: a.active }) },
+  { name: 'delete_health_item', description: 'Gesundheitspunkt samt Verlauf löschen. Zum blossen Ausblenden besser update_health_item mit active=false.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID') }, required: ['id'] }, destructive: true, run: (u, a) => ops.healthItemDelete(a.id) },
+  { name: 'get_health_day', description: 'Tagesliste Gesundheit: was an einem Tag abgehakt ist. Ohne person für beide.', inputSchema: { type: 'object', properties: { date: P('string', 'YYYY-MM-DD, Standard heute'), person: P('string', 'Schlüssel der Person (optional)') } }, readOnly: true, run: (u, a) => {
+      const p = a.person ? actor(u, a) : null;
+      return p ? healthDay(p, a.date) : Object.keys(USERS).map(k => healthDay(k, a.date));
+    } },
+  { name: 'set_health_check', description: 'Gesundheitspunkt für einen Tag abhaken oder zurücksetzen.', inputSchema: { type: 'object', properties: { item_id: P('integer', 'ID aus list_health_items'), done: P('boolean', 'true = gemacht, false = zurücksetzen'), date: P('string', 'YYYY-MM-DD, Standard heute, höchstens 60 Tage zurück'), person: PERSON }, required: ['item_id', 'done'] }, run: (u, a) => {
+      const h = ops.healthItemGet(a.item_id);
+      return ops.healthCheck(actor(u, a, h.person || undefined), a.item_id, a.date, !!a.done);
+    } },
+  { name: 'get_health_stats', description: 'Monatsstatistik Gesundheit pro Person: an wie vielen Tagen welcher Punkt gemacht wurde, Prozent, aktuelle Serie, Tage mit allem erledigt. Ohne person für beide.', inputSchema: { type: 'object', properties: { month: P('string', 'YYYY-MM, Standard aktueller Monat'), person: P('string', 'Schlüssel der Person (optional)') } }, readOnly: true, run: (u, a) => {
+      const p = a.person ? actor(u, a) : null;
+      return p ? healthStats(p, a.month) : Object.keys(USERS).map(k => healthStats(k, a.month));
+    } },
 ];
-const MCP_INSTRUCTIONS = 'Flechte ist die Haushalts-App eines Paares: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (Ziel: jede Woche jemand zu Gast) und ein gemeinsames Wochen-Teamziel in Punkten. Rufe zuerst get_overview auf. Daten sind auf Deutsch, Datumsformat YYYY-MM-DD, Zeitzone ' + TZ + '. Das Konto kann von beiden Personen gemeinsam genutzt werden: Gib bei Aktionen, die einer Person zugerechnet werden, den Parameter person an und frage nach, wenn nicht klar ist, wer gerade schreibt. Haushaltsaufgaben haben eine feste zuständige Person (assignee).';
+const MCP_INSTRUCTIONS = 'Flechte ist die Haushalts-App eines Paares: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (Ziel: jede Woche jemand zu Gast) und ein gemeinsames Wochen-Teamziel in Punkten. Dazu gibt es eine tägliche Gesundheits-Checkliste pro Person mit Monatsstatistik sowie einen Verlauf und eine Monatsstatistik der Haushaltsaufgaben. Rufe zuerst get_overview auf. Daten sind auf Deutsch, Datumsformat YYYY-MM-DD, Zeitzone ' + TZ + '. Das Konto kann von beiden Personen gemeinsam genutzt werden: Gib bei Aktionen, die einer Person zugerechnet werden, den Parameter person an und frage nach, wenn nicht klar ist, wer gerade schreibt. Haushaltsaufgaben haben eine feste zuständige Person (assignee).';
 const mcpRate = new Map();
 async function handleMcp(req, res) {
   if (req.method === 'GET' || req.method === 'DELETE') return send(res, 405, { error: 'Nur POST' }, undefined, { Allow: 'POST' });
@@ -571,7 +721,7 @@ async function handleMcp(req, res) {
     const isNote = msg.id === undefined;
     const ok = result => isNote ? null : { jsonrpc: '2.0', id: msg.id, result };
     switch (msg.method) {
-      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.1.0' }, instructions: MCP_INSTRUCTIONS });
+      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.2.0' }, instructions: MCP_INSTRUCTIONS });
       case 'ping': return ok({});
       case 'tools/list': return ok({ tools: MCP_TOOLS.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, annotations: { readOnlyHint: !!t.readOnly, destructiveHint: !!t.destructive, openWorldHint: false } })) });
       case 'tools/call': {

@@ -87,3 +87,35 @@ li.isdone .who b { text-decoration: line-through; color: var(--muted); }
 .wrap > *, #app > * { min-width: 0; }
 #app { display: grid; gap: 14px; min-width: 0; }
 .tabs { margin-bottom: 0; }
+
+.checks { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.check { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; color: var(--fg); font-weight: 500; }
+.check .box { flex: none; width: 24px; height: 24px; border-radius: 7px; border: 2px solid var(--line); display: grid; place-items: center; color: var(--surface); font-size: 15px; line-height: 1; }
+.check[aria-pressed="true"] { border-color: var(--ok); background: var(--ok-bg); }
+.check[aria-pressed="true"] .box { background: var(--ok); border-color: var(--ok); }
+.check .lbl { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.check small { color: var(--muted); font-weight: 500; }
+.monthnav { display: flex; align-items: center; gap: 4px; }
+.monthnav strong { font-family: var(--display); min-width: 9.5em; text-align: center; }
+.monthnav button { font-size: 1.3rem; padding: 2px 10px; }
+.statrow { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.stat { display: grid; }
+.stat b { font-family: var(--display); font-size: 1.5rem; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.stat span { color: var(--muted); font-size: .8rem; }
+.hitem { display: grid; gap: 6px; padding: 10px 0; border-top: 1px solid var(--line); }
+.hitem:first-child { border-top: 0; }
+.hitem .top { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.hitem .top span { color: var(--muted); font-size: .85rem; font-variant-numeric: tabular-nums; }
+.cal { display: grid; grid-template-columns: repeat(auto-fill, minmax(14px, 1fr)); gap: 3px; }
+.cal i { aspect-ratio: 1; border-radius: 3px; background: var(--line); max-width: 100%; }
+.cal i.on { background: var(--ok); }
+.cal i.na { opacity: .35; }
+.cal i.future { background: transparent; border: 1px dashed var(--line); }
+.tablewrap { overflow-x: auto; }
+table.stats { width: 100%; border-collapse: collapse; font-size: .88rem; font-variant-numeric: tabular-nums; }
+table.stats th { text-align: left; font-weight: 600; color: var(--muted); font-size: .75rem; letter-spacing: .03em; text-transform: uppercase; padding: 4px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+table.stats td { padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.stats td.n { text-align: right; white-space: nowrap; }
+table.stats td.name { min-width: 9em; }
+.bad-t { color: var(--bad); } .ok-t { color: var(--ok); } .warn-t { color: var(--warn); }
+details summary { cursor: pointer; color: var(--accent); font-weight: 600; padding: 4px 0; }

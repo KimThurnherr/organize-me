@@ -1,6 +1,6 @@
 # Flechte
 
-Kleine Haushalts-PWA für zwei Personen: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (jede Woche jemand zu Gast), gemeinsames Wochenziel mit Punkten und Serie, Web-Push morgens und abends und eine MCP-Schnittstelle, über die sich alles aus einem KI-Assistenten heraus pflegen lässt.
+Kleine Haushalts-PWA für zwei Personen: wiederkehrende Aufgaben mit fester Zuständigkeit samt Verlauf und Monatsstatistik, tägliche Gesundheits-Checkliste pro Person mit Monatsstatistik, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (jede Woche jemand zu Gast), gemeinsames Wochenziel mit Punkten und Serie, Web-Push morgens und abends und eine MCP-Schnittstelle, über die sich alles aus einem KI-Assistenten heraus pflegen lässt.
 
 Ohne externe Abhängigkeiten: Node 24 (`node:http`, `node:sqlite`, `node:crypto`). Web-Push (RFC 8291/8292) ist selbst implementiert, VAPID-Schlüssel und Session-Secret werden beim ersten Start erzeugt und im Datenvolume gespeichert.
 
@@ -37,4 +37,4 @@ Push funktioniert nur, wenn die Seite in Safari über «Teilen» → «Zum Home-
 
 ## MCP-Schnittstelle
 
-`POST <PUBLIC_URL>/mcp` (Streamable HTTP, JSON-Antworten, zustandslos) mit `Authorization: Bearer <token>`. Mit einem persönlichen Token handelt der Aufruf im Namen dieser Person, mit dem gemeinsamen Token gibt der Parameter `person` an, wer handelt (erledigte Aufgaben zählen ohne Angabe für die zuständige Person). Werkzeuge: Überblick, Haushaltsaufgaben (anlegen, ändern, löschen, erledigen), To-dos, Essensplan lesen und setzen, Gäste und Besuche, Push-Zeiten und Teamziel. Begrenzt auf 120 Anfragen pro Minute und Token.
+`POST <PUBLIC_URL>/mcp` (Streamable HTTP, JSON-Antworten, zustandslos) mit `Authorization: Bearer <token>`. Mit einem persönlichen Token handelt der Aufruf im Namen dieser Person, mit dem gemeinsamen Token gibt der Parameter `person` an, wer handelt (erledigte Aufgaben zählen ohne Angabe für die zuständige Person). Werkzeuge: Überblick, Haushaltsaufgaben (anlegen, ändern, löschen, erledigen, nachtragen, Verlauf, Statistik), Gesundheits-Checkliste (Punkte verwalten, abhaken, Statistik), To-dos, Essensplan lesen und setzen, Gäste und Besuche, Push-Zeiten und Teamziel. Begrenzt auf 120 Anfragen pro Minute und Token.

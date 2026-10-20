@@ -2,6 +2,12 @@
 const $ = id => document.getElementById(id);
 let S = null, tab = 'home', pending = null, editing = null, selected = new Set(), busy = false;
 let weekOffset = null, mealsDirty = false, mealsKey = '';
+let H = null, hDate = null, hMonth = null, hPerson = null, hEditing = null, CH = null, cMonth = null;
+const MONTHS = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
+const WDS = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+const dstrN = n => new Date(n * 864e5).toISOString().slice(0, 10);
+const monthLabel = m => MONTHS[+m.slice(5) - 1] + ' ' + m.slice(0, 4);
+const shiftMonth = (m, d) => { let y = +m.slice(0, 4), mo = +m.slice(5) + d; while (mo < 1) { mo += 12; y--; } while (mo > 12) { mo -= 12; y++; } return y + '-' + String(mo).padStart(2, '0'); };
 const NAME = k => S?.users.find(u => u.key === k)?.name || k || '';
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const dayNum = s => { const [y, m, d] = s.split('-').map(Number); return Date.UTC(y, m - 1, d) / 864e5; };
@@ -36,6 +42,8 @@ async function load() {
   $('login').hidden = true; $('app').hidden = false;
   $('whoami').textContent = NAME(S.me);
   render(); updatePushUi();
+  if (tab === 'health') loadHealth();
+  if (tab === 'chores') loadChoreHist();
 }
 function showLogin() {
   $('app').hidden = true; $('login').hidden = false; $('whoami').textContent = '';
@@ -94,6 +102,15 @@ function render() {
 
   // Essen
   renderMeals();
+
+  // Gesundheit heute (Startseite)
+  const hh = $('healthHome'); hh.innerHTML = '';
+  for (const it of S.healthToday.items) hh.appendChild(checkItem(it, S.today));
+  $('healthHomeCard').hidden = !S.healthToday.items.length;
+  const hOpen = S.healthToday.items.filter(i => !i.done).length;
+  $('badgeHealth').hidden = !hOpen; $('badgeHealth').textContent = hOpen;
+  if (tab === 'health') renderHealth();
+  if (tab === 'chores') renderChoreHist();
 
   // Fällig
   const dueChores = u => S.chores.filter(c => c.assignee === u).map(c => ({ c, s: choreState(c) })).filter(x => x.s.due).sort((a, b) => b.s.over - a.s.over);
@@ -216,6 +233,109 @@ function renderMeals() {
   }
 }
 
+// ---------- Gesundheit ----------
+function checkItem(it, date) {
+  const l = document.createElement('li');
+  const b = document.createElement('button'); b.type = 'button'; b.className = 'check'; b.setAttribute('aria-pressed', it.done);
+  b.innerHTML = '<span class="box">' + (it.done ? '✓' : '') + '</span><span class="lbl">' + esc(it.name) + (it.only_for ? ' <small>nur ' + esc(NAME(it.only_for)) + '</small>' : '') + '</span>';
+  b.addEventListener('click', async () => {
+    if (busy) return; busy = true;
+    try { await call('POST', 'health/check', { item_id: it.id, date, done: !it.done }); } catch (e) { toast(e.message); }
+    busy = false; await load();
+  });
+  l.appendChild(b); return l;
+}
+async function loadHealth() {
+  if (!hDate) hDate = S.today; if (!hMonth) hMonth = S.today.slice(0, 7); if (!hPerson) hPerson = S.me;
+  try { H = await call('GET', 'health?date=' + hDate + '&month=' + hMonth + '&person=' + hPerson); } catch (e) { return toast(e.message); }
+  renderHealth();
+}
+function renderHealth() {
+  if (!H) return;
+  const d = H.day, back = dayNum(S.today) - dayNum(d.date);
+  $('hdLabel').textContent = back === 0 ? 'Heute' : back === 1 ? 'Gestern' : WDS[new Date(dayNum(d.date) * 864e5).getUTCDay()] + ' ' + fmt(d.date).slice(0, 6);
+  $('hdNext').disabled = back <= 0; $('hdPrev').disabled = back >= 60;
+  const done = d.items.filter(i => i.done).length;
+  const pill = $('hdPill'); pill.textContent = done + ' von ' + d.items.length; pill.className = 'pill ' + (done === d.items.length && done ? 'ok' : 'warn');
+  const ul = $('healthDay'); ul.innerHTML = '';
+  for (const it of d.items) ul.appendChild(checkItem(it, d.date));
+  if (!d.items.length) ul.appendChild(li('<p class="empty">Keine Punkte für dich. Unten hinzufügen.</p>'));
+
+  const st = H.stats;
+  $('hmLabel').textContent = monthLabel(st.month);
+  $('hmNext').disabled = st.month >= S.today.slice(0, 7);
+  const pc = $('hsPeople'); pc.innerHTML = '';
+  for (const u of S.users) { const b = btn(u.name, 'chip', () => { hPerson = u.key; loadHealth(); }); b.setAttribute('aria-pressed', u.key === hPerson); pc.appendChild(b); }
+  const act = st.items.filter(i => i.possible_days);
+  const avg = act.length ? Math.round(act.reduce((a, i) => a + i.percent, 0) / act.length) : 0;
+  $('healthSummary').innerHTML = '<div class="stat"><b>' + st.complete_days + '</b><span>Tage alles erledigt</span></div><div class="stat"><b>' + avg + ' %</b><span>Durchschnitt</span></div><div class="stat"><b>' + st.days + '</b><span>Tage erfasst</span></div>';
+  const box = $('healthStats'); box.innerHTML = '';
+  const [y, m] = st.month.split('-').map(Number), dim = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  for (const it of st.items) {
+    const dv = document.createElement('div'); dv.className = 'hitem';
+    let cal = '';
+    for (let i = 1; i <= dim; i++) {
+      const ds = st.month + '-' + String(i).padStart(2, '0');
+      const cls = ds > S.today ? 'future' : it.dates.includes(ds) ? 'on' : ds < it.since ? 'na' : '';
+      cal += '<i class="' + cls + '" title="' + fmt(ds) + '"></i>';
+    }
+    dv.innerHTML = '<div class="top"><b>' + esc(it.name) + (it.active ? '' : ' <small class="hint">(pausiert)</small>') + '</b><span>' + it.done_days + ' von ' + it.possible_days + ' Tagen · ' + it.percent + ' %' + (it.streak > 1 ? ' · Serie ' + it.streak + ' Tage' : '') + '</span></div><div class="cal">' + cal + '</div>';
+    box.appendChild(dv);
+  }
+  if (!st.items.length) box.innerHTML = '<p class="empty">Keine Daten in diesem Monat.</p>';
+
+  // Verwaltung
+  const il = $('healthItems'); il.innerHTML = '';
+  for (const it of H.items) {
+    if (hEditing === it.id) {
+      const l = document.createElement('li'); const f = document.createElement('form'); f.className = 'row'; f.style.width = '100%';
+      f.innerHTML = '<label class="grow">Name<input type="text" name="n" maxlength="80" required></label><label style="flex:0 1 140px">Für<select name="p"></select></label>';
+      f.n.value = it.name; f.p.add(new Option('Beide', '')); for (const u of S.users) f.p.add(new Option(u.name, u.key)); f.p.value = it.person || '';
+      const sv = document.createElement('button'); sv.type = 'submit'; sv.className = 'primary'; sv.textContent = 'Speichern'; f.appendChild(sv);
+      f.appendChild(btn('Abbrechen', 'link', () => { hEditing = null; renderHealth(); }));
+      f.addEventListener('submit', async e => { e.preventDefault(); hEditing = null; await act('PATCH', 'health/items/' + it.id, { name: f.n.value, person: f.p.value }, 'Gespeichert'); });
+      l.appendChild(f); il.appendChild(l); continue;
+    }
+    const l = li('<div class="who"><b>' + esc(it.name) + '</b><div>' + (it.person ? 'nur ' + esc(NAME(it.person)) : 'für beide') + (it.active ? '' : ' · pausiert') + '</div></div>');
+    l.appendChild(btn('Ändern', 'link', () => { hEditing = it.id; pending = null; renderHealth(); }));
+    l.appendChild(btn(it.active ? 'Pausieren' : 'Aktivieren', 'link', () => act('PATCH', 'health/items/' + it.id, { active: !it.active }, it.active ? 'Pausiert' : 'Aktiviert')));
+    l.appendChild(confirmBtn('h' + it.id, 'Löschen', 'Samt Verlauf löschen?', () => act('DELETE', 'health/items/' + it.id, null, 'Gelöscht')));
+    il.appendChild(l);
+  }
+  fillSelect($('hiWho'), true);
+}
+
+// ---------- Haushalt: Verlauf & Statistik ----------
+async function loadChoreHist() {
+  if (!cMonth) cMonth = S.today.slice(0, 7);
+  try { CH = await call('GET', 'chores/history?month=' + cMonth); } catch (e) { return toast(e.message); }
+  renderChoreHist();
+}
+function renderChoreHist() {
+  if (!CH) return;
+  const st = CH.stats;
+  $('cmLabel').textContent = monthLabel(st.month);
+  $('cmNext').disabled = st.month >= S.today.slice(0, 7);
+  let sum = '<div class="stat"><b>' + st.total + '</b><span>Erledigungen</span></div>';
+  for (const u of S.users) sum += '<div class="stat"><b>' + (st.by_person[u.key] || 0) + '</b><span>' + esc(u.name) + '</span></div>';
+  sum += '<div class="stat"><b>' + (st.on_time_percent === null ? '–' : st.on_time_percent + ' %') + '</b><span>pünktlich</span></div>';
+  $('choreSummary').innerHTML = sum;
+  let t = '<thead><tr><th>Aufgabe</th><th>Wer</th><th>Erledigt</th><th>Ø Abstand</th><th>Verspätet</th></tr></thead><tbody>';
+  for (const c of st.chores.slice().sort((a, b) => (b.count / (b.expected || 1)) - (a.count / (a.expected || 1)) || a.name.localeCompare(b.name))) {
+    const ratio = c.expected ? c.count / c.expected : 1;
+    const cls = ratio >= 1 ? 'ok-t' : ratio >= .5 ? 'warn-t' : 'bad-t';
+    t += '<tr><td class="name">' + esc(c.name) + '</td><td>' + esc(NAME(c.assignee)) + '</td><td class="n ' + cls + '">' + c.count + ' / ' + c.expected + '</td><td class="n">' + (c.avg_gap_days === null ? '–' : c.avg_gap_days + ' T') + ' <small class="hint">(' + c.interval_days + ')</small></td><td class="n">' + (c.late ? '<span class="bad-t">' + c.late + '×, max ' + c.max_days_late + ' T</span>' : (c.on_time ? '<span class="ok-t">nie</span>' : '–')) + '</td></tr>';
+  }
+  $('choreStats').innerHTML = t + '</tbody>';
+  const hl = $('choreHistory'); hl.innerHTML = '';
+  if (!CH.history.length) hl.appendChild(li('<p class="empty">Noch nichts erledigt in diesem Monat.</p>'));
+  for (const e of CH.history) {
+    const l = li('<div class="who"><b>' + esc(e.name) + '</b><div>' + WDS[new Date(dayNum(e.date) * 864e5).getUTCDay()] + ' ' + fmt(e.date) + ' · ' + esc(NAME(e.by)) + ' · +' + e.points + '</div></div>');
+    l.appendChild(confirmBtn('ch' + e.log_id, 'Entfernen', 'Wirklich entfernen?', () => act('DELETE', 'chores/history/' + e.log_id, null, 'Eintrag entfernt')));
+    hl.appendChild(l);
+  }
+}
+
 function editRow(c) {
   const l = document.createElement('li');
   const f = document.createElement('form'); f.className = 'edit';
@@ -242,7 +362,17 @@ $('visitForm').addEventListener('submit', async e => {
 });
 $('settingsForm').addEventListener('submit', async e => { e.preventDefault(); await act('POST', 'settings', { morning: $('sMorning').value, evening: $('sEvening').value, teamGoal: +$('sGoal').value }, 'Gespeichert'); });
 $('logout').addEventListener('click', async () => { await fetch('/auth/logout', { method: 'POST' }); location.href = '/'; });
-for (const b of document.querySelectorAll('.tab')) b.addEventListener('click', () => { tab = b.dataset.tab; pending = null; editing = null; render(); });
+for (const b of document.querySelectorAll('.tab')) b.addEventListener('click', () => { tab = b.dataset.tab; pending = null; editing = null; hEditing = null; render(); if (tab === 'health') loadHealth(); if (tab === 'chores') loadChoreHist(); });
+
+// Gesundheit & Verlauf
+$('toHealth').addEventListener('click', () => { tab = 'health'; render(); loadHealth(); });
+$('hdPrev').addEventListener('click', () => { hDate = dstrN(dayNum(hDate) - 1); loadHealth(); });
+$('hdNext').addEventListener('click', () => { hDate = dstrN(dayNum(hDate) + 1); loadHealth(); });
+$('hmPrev').addEventListener('click', () => { hMonth = shiftMonth(hMonth, -1); loadHealth(); });
+$('hmNext').addEventListener('click', () => { hMonth = shiftMonth(hMonth, 1); loadHealth(); });
+$('cmPrev').addEventListener('click', () => { cMonth = shiftMonth(cMonth, -1); loadChoreHist(); });
+$('cmNext').addEventListener('click', () => { cMonth = shiftMonth(cMonth, 1); loadChoreHist(); });
+$('healthItemForm').addEventListener('submit', async e => { e.preventDefault(); const d = await act('POST', 'health/items', { name: $('hiName').value, person: $('hiWho').value }, 'Hinzugefügt'); if (d) $('hiName').value = ''; });
 
 // Essen
 $('toMeals').addEventListener('click', () => { tab = 'meals'; render(); });
