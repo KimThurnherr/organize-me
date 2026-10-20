@@ -1,0 +1,43 @@
+services:
+  flechte:
+    image: node:24-alpine
+    restart: unless-stopped
+    user: "1000:1000"
+    working_dir: /home/node
+    # Holt beim Start den Code aus dem GitHub-Repo und startet ihn.
+    # Ein Neustart des Containers spielt damit den aktuellen Stand von GITHUB_REF ein.
+    command:
+      - sh
+      - -c
+      - >-
+        rm -rf /tmp/app && mkdir -p /tmp/app &&
+        node -e "fetch('https://api.github.com/repos/'+process.env.GITHUB_REPO+'/tarball/'+process.env.GITHUB_REF,{headers:{'User-Agent':'flechte'}}).then(async r=>{if(!r.ok)throw new Error('GitHub '+r.status);require('fs').writeFileSync('/tmp/app.tgz',Buffer.from(await r.arrayBuffer()))}).catch(e=>{console.error(e.message);process.exit(1)})" &&
+        tar xzf /tmp/app.tgz -C /tmp/app --strip-components=1 && rm /tmp/app.tgz &&
+        cd /tmp/app && exec node server.js
+    environment:
+      PORT: "8080"
+      DATA_DIR: /home/node/data
+      TZ: Europe/Zurich
+      NODE_NO_WARNINGS: "1"
+      PUBLIC_URL: ${PUBLIC_URL}
+      ALLOWED_USERS: ${ALLOWED_USERS}
+      USER_NAMES: ${USER_NAMES}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GITHUB_REPO: ${GITHUB_REPO}
+      GITHUB_REF: ${GITHUB_REF:-main}
+    volumes:
+      - flechte-data:/home/node/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  flechte-data:

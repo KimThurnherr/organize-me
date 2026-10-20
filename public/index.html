@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Flechte</title>
+<meta name="theme-color" content="#6b2d5c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Flechte">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Figtree:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>Flechte</h1>
+    <span class="whoami" id="whoami"></span>
+  </header>
+
+  <div id="login" class="card login" hidden>
+    <h2>Willkommen</h2>
+    <p class="hint">Melde dich mit deinem Google-Konto an. Nur freigegebene Adressen haben Zugriff.</p>
+    <p class="notice" id="loginMsg" hidden></p>
+    <a class="button primary" href="/auth/login" id="loginBtn">Mit Google anmelden</a>
+  </div>
+
+  <div id="app" hidden>
+    <nav class="tabs" role="tablist">
+      <button class="tab" role="tab" data-tab="home">Heute<span class="badge" id="badgeHome" hidden></span></button>
+      <button class="tab" role="tab" data-tab="chores">Haushalt</button>
+      <button class="tab" role="tab" data-tab="todos">To-dos</button>
+      <button class="tab" role="tab" data-tab="guests">Gäste</button>
+      <button class="tab" role="tab" data-tab="settings">Einstellungen</button>
+    </nav>
+
+    <div class="notice" id="pushHint" hidden></div>
+
+    <!-- Heute -->
+    <div data-panel="home" class="panel">
+      <div class="card goal">
+        <div class="goal-head">
+          <h2>Teamziel diese Woche</h2>
+          <span class="pill" id="goalPill"></span>
+        </div>
+        <div class="big" id="teamBig">0</div>
+        <div class="track"><div class="fill" id="teamFill"></div></div>
+        <div class="weeks" id="weeks" aria-label="Letzte 8 Wochen"></div>
+        <p class="hint" id="teamHint"></p>
+      </div>
+      <div class="card">
+        <h2>Für dich fällig</h2>
+        <ul class="list" id="myDue"></ul>
+      </div>
+      <div class="card">
+        <h2>Gäste</h2>
+        <div class="big small-big" id="guestBig">–</div>
+        <span class="pill" id="guestPill"></span>
+      </div>
+      <div class="card">
+        <h2 id="otherTitle">Beim anderen fällig</h2>
+        <ul class="list" id="otherDue"></ul>
+      </div>
+    </div>
+
+    <!-- Haushalt -->
+    <section data-panel="chores" class="panel" hidden>
+      <div><h2>Haushalt</h2><p class="hint">Jede Aufgabe hat eine feste Person. Erledigt antippen zählt fürs Teamziel.</p></div>
+      <div class="card"><ul class="list" id="choreList"></ul></div>
+      <form class="card" id="choreForm">
+        <h2>Aufgabe hinzufügen</h2>
+        <label for="cName">Aufgabe<input type="text" id="cName" maxlength="80" required></label>
+        <div class="row">
+          <label for="cInt">Alle … Tage<input type="number" id="cInt" min="1" max="365" value="7" required></label>
+          <label for="cPts">Punkte<input type="number" id="cPts" min="1" max="100" value="10" required></label>
+          <label for="cWho">Wer<select id="cWho"></select></label>
+        </div>
+        <div><button class="ghost" type="submit">Hinzufügen</button></div>
+      </form>
+    </section>
+
+    <!-- To-dos -->
+    <section data-panel="todos" class="panel" hidden>
+      <div><h2>To-dos</h2><p class="hint">Einmalige Aufgaben, je 5 Punkte.</p></div>
+      <form class="card" id="todoForm">
+        <label for="tTitle">Was ist zu tun?<input type="text" id="tTitle" maxlength="140" required></label>
+        <div class="row">
+          <label for="tDue">Bis (optional)<input type="date" id="tDue"></label>
+          <label for="tWho">Für<select id="tWho"></select></label>
+        </div>
+        <div><button class="ghost" type="submit">To-do hinzufügen</button></div>
+      </form>
+      <div class="card"><ul class="list" id="todoList"></ul></div>
+    </section>
+
+    <!-- Gäste -->
+    <section data-panel="guests" class="panel" hidden>
+      <div><h2>Besuch eintragen</h2><p class="hint">Ziel: jede Woche jemand zu Gast. Ein Besuch gibt 10 Punkte pro Person.</p></div>
+      <form class="card" id="visitForm">
+        <label for="vDate">Datum<input type="date" id="vDate" required></label>
+        <div class="chips" id="vGuests"></div>
+        <p class="empty" id="vGuestsEmpty">Noch keine Freunde erfasst. Unten hinzufügen.</p>
+        <label for="vNote">Notiz (optional)<input type="text" id="vNote" maxlength="200" placeholder="z.B. Raclette-Abend"></label>
+        <div><button class="primary" type="submit">Besuch speichern</button></div>
+      </form>
+      <div><h2>Wen als Nächstes einladen?</h2><p class="hint">Am längsten nicht mehr bei euch zuoberst.</p></div>
+      <div class="card"><ul class="list" id="suggest"></ul></div>
+      <form class="card" id="personForm">
+        <div class="row">
+          <label class="grow" for="pName">Freund hinzufügen<input type="text" id="pName" maxlength="80" required placeholder="Name oder Paar"></label>
+          <button class="ghost" type="submit">Hinzufügen</button>
+        </div>
+      </form>
+      <h2>Verlauf</h2>
+      <div class="card"><ul class="list" id="history"></ul></div>
+    </section>
+
+    <!-- Einstellungen -->
+    <section data-panel="settings" class="panel" hidden>
+      <form class="card" id="settingsForm">
+        <h2>Erinnerungen</h2>
+        <p class="hint">Push kommt nur, wenn bei dir etwas fällig ist.</p>
+        <div class="row">
+          <label for="sMorning">Morgens<input type="time" id="sMorning" required></label>
+          <label for="sEvening">Abends<input type="time" id="sEvening" required></label>
+          <label for="sGoal">Teamziel pro Woche<input type="number" id="sGoal" min="10" max="2000" required></label>
+        </div>
+        <div><button class="primary" type="submit">Speichern</button></div>
+      </form>
+      <div class="card">
+        <h2>Push auf diesem Gerät</h2>
+        <p class="hint" id="pushState"></p>
+        <div class="row">
+          <button class="primary" type="button" id="pushOn">Push aktivieren</button>
+          <button class="ghost" type="button" id="pushTest">Test-Push senden</button>
+          <button class="link" type="button" id="pushOff">Push auf diesem Gerät beenden</button>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Konto</h2>
+        <div><button class="ghost" type="button" id="logout">Abmelden</button></div>
+      </div>
+    </section>
+  </div>
+</div>
+<div class="toast" id="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>
