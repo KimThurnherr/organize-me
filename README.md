@@ -13,6 +13,7 @@ Ohne externe Abhängigkeiten: Node 24 (`node:http`, `node:sqlite`, `node:crypto`
 | `USER_NAMES` | `alex:Alex,sam:Sam` | Anzeigenamen |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | | OAuth-Client (Webanwendung), Redirect-URI `<PUBLIC_URL>/auth/callback` |
 | `GITHUB_REPO` / `GITHUB_REF` | `owner/repo`, `main` | Woher der Container den Code beim Start holt |
+| `BIND_ADDR` / `HOST_PORT` | `127.0.0.1`, `8080` | Wo der Port auf dem Host veröffentlicht wird (hinter einem Reverse Proxy mit TLS betreiben) |
 | `TZ` | `Europe/Zurich` | Zeitzone für Fälligkeiten und Push-Zeiten |
 
 ## Lokal starten
