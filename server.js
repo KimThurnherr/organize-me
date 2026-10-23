@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS push_sent (user TEXT, slot TEXT, date TEXT, PRIMARY K
 CREATE TABLE IF NOT EXISTS guest_reminders (guest_id INTEGER NOT NULL, user TEXT NOT NULL, date TEXT NOT NULL, PRIMARY KEY (guest_id, user));
 CREATE TABLE IF NOT EXISTS health_items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, person TEXT, active INTEGER NOT NULL DEFAULT 1, created_at TEXT);
 CREATE TABLE IF NOT EXISTS health_checks (item_id INTEGER NOT NULL, user TEXT NOT NULL, date TEXT NOT NULL, at TEXT, PRIMARY KEY (item_id, user, date));
+CREATE TABLE IF NOT EXISTS shopping (id INTEGER PRIMARY KEY, name TEXT NOT NULL, qty TEXT, done INTEGER NOT NULL DEFAULT 0, added_by TEXT, added_at TEXT, done_by TEXT, done_at TEXT);
+CREATE TABLE IF NOT EXISTS shopping_names (name TEXT PRIMARY KEY COLLATE NOCASE, n INTEGER NOT NULL DEFAULT 0, last TEXT);
 CREATE TABLE IF NOT EXISTS meals (date TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT, updated_by TEXT, updated_at TEXT);
 `);
 const q = (sql) => db.prepare(sql);
@@ -243,6 +245,8 @@ function state(user) {
     totalPoints: q('SELECT COALESCE(SUM(points),0) AS s FROM log').get().s,
     meals: q('SELECT date, title, note FROM meals WHERE date >= ? AND date <= ? ORDER BY date').all(dateStr(weekStart(localNow().date) - 7), dateStr(weekStart(localNow().date) + 13)),
     healthToday: healthDay(user),
+    shopping: shoppingList(),
+    shoppingSuggestions: q('SELECT name FROM shopping_names ORDER BY n DESC, last DESC LIMIT 150').all().map(r => r.name),
     longAbsent: longAbsentGuests(),
     guestRemindDays: GUEST_REMIND_DAYS,
     mealIdeas: q('SELECT title, COUNT(*) AS n FROM meals GROUP BY lower(title) ORDER BY n DESC, max(date) DESC LIMIT 60').all().map(r => r.title),
@@ -398,6 +402,31 @@ const ops = {
     else q('DELETE FROM health_checks WHERE item_id=? AND user=? AND date=?').run(h.id, user, d);
     return { ok: true, date: d, done: !!done };
   },
+  shopGet(id) { const i = q('SELECT * FROM shopping WHERE id=?').get(+id); if (!i) fail(404, 'Artikel nicht gefunden'); return i; },
+  shopAdd(user, b) {
+    const name = str(b.name, 80), qty = str(b.qty, 30);
+    if (!name) fail(400, 'Bitte einen Artikel angeben.');
+    q('INSERT INTO shopping_names(name,n,last) VALUES(?,1,?) ON CONFLICT(name) DO UPDATE SET n=n+1, last=excluded.last').run(name, nowIso());
+    const ex = q('SELECT * FROM shopping WHERE done=0 AND lower(name)=lower(?)').get(name);
+    if (ex) { if (qty && qty !== ex.qty) q('UPDATE shopping SET qty=? WHERE id=?').run(ex.qty ? ex.qty + ' + ' + qty : qty, ex.id); return { ok: true, id: ex.id, merged: true }; }
+    const r = q('INSERT INTO shopping(name,qty,added_by,added_at) VALUES(?,?,?,?)').run(name, qty || null, user, nowIso());
+    return { ok: true, id: Number(r.lastInsertRowid) };
+  },
+  shopUpdate(id, b) {
+    const i = ops.shopGet(id);
+    const name = b.name !== undefined ? str(b.name, 80) : i.name, qty = b.qty !== undefined ? str(b.qty, 30) : (i.qty || '');
+    if (!name) fail(400, 'Name darf nicht leer sein');
+    q('UPDATE shopping SET name=?, qty=? WHERE id=?').run(name, qty || null, i.id);
+    return { ok: true };
+  },
+  shopSetDone(user, id, done) {
+    const i = ops.shopGet(id);
+    if (done) q('UPDATE shopping SET done=1, done_by=?, done_at=? WHERE id=?').run(user, nowIso(), i.id);
+    else q('UPDATE shopping SET done=0, done_by=NULL, done_at=NULL WHERE id=?').run(i.id);
+    return { ok: true };
+  },
+  shopDelete(id) { const i = ops.shopGet(id); q('DELETE FROM shopping WHERE id=?').run(i.id); return { ok: true }; },
+  shopClearDone() { const r = q('DELETE FROM shopping WHERE done=1').run(); return { ok: true, removed: Number(r.changes) }; },
   settingsSet(user, b) {
     const cur = q('SELECT morning, evening FROM user_settings WHERE user=?').get(user) || { morning: '09:00', evening: '18:00' };
     const mo = b.morning !== undefined ? str(b.morning, 5) : cur.morning, ev = b.evening !== undefined ? str(b.evening, 5) : cur.evening;
@@ -476,6 +505,12 @@ function choreStats(month) {
   return { month: m, total, by_person: people, on_time_percent: rated ? Math.round(onTime / rated * 100) : null, chores };
 }
 
+// Einkaufsliste: offene Artikel in Erfassungsreihenfolge, erledigte der letzten 7 Tage (ältere werden aufgeräumt)
+function shoppingList() {
+  q('DELETE FROM shopping WHERE done=1 AND done_at < ?').run(new Date(Date.now() - 7 * 864e5).toISOString());
+  return q('SELECT id, name, qty, done, added_by, added_at, done_by, done_at FROM shopping ORDER BY done, CASE WHEN done=1 THEN done_at END DESC, id').all();
+}
+
 // ---------- API ----------
 async function api(req, res, user, route) {
   const m = req.method;
@@ -507,6 +542,11 @@ async function api(req, res, user, route) {
     if (m === 'POST' && route === 'visits') return send(res, 200, ops.visitAdd(user, body));
     if ((mm = route.match(/^visits\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.visitDelete(mm[1]));
     if (m === 'POST' && route === 'settings') return send(res, 200, ops.settingsSet(user, body));
+    if (m === 'POST' && route === 'shopping') return send(res, 200, ops.shopAdd(user, body));
+    if (m === 'POST' && route === 'shopping/clear') return send(res, 200, ops.shopClearDone());
+    if ((mm = route.match(/^shopping\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.shopUpdate(mm[1], body));
+    if ((mm = route.match(/^shopping\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.shopDelete(mm[1]));
+    if ((mm = route.match(/^shopping\/(\d+)\/done$/)) && m === 'POST') return send(res, 200, ops.shopSetDone(user, mm[1], !!body.done));
   } catch (e) {
     if (e instanceof OpError) return send(res, e.status, { error: e.message });
     throw e;
@@ -732,12 +772,13 @@ function overview() {
     open_todos: q('SELECT id, title, due, assignee FROM todos WHERE done=0 ORDER BY COALESCE(due, \'9999\'), id').all(),
     meals: q('SELECT date, title, note FROM meals WHERE date >= ? AND date <= ? ORDER BY date').all(dateStr(ws), dateStr(ws + 13)).map(m => ({ ...m, weekday: wdOf(m.date) })),
     health_today: Object.keys(USERS).map(k => healthDay(k, today)),
+    shopping_open: q('SELECT id, name, qty FROM shopping WHERE done=0 ORDER BY id').all(),
     guests: { last_visit: lastVisit, planned_visits: planned, days_since: lastVisit ? dayNum(today) - dayNum(lastVisit) : null, goal: 'jede Woche jemand zu Gast', long_absent: longAbsentGuests(), long_absent_threshold_days: GUEST_REMIND_DAYS },
   };
 }
 const P = (type, description, extra = {}) => ({ type, description, ...extra });
 const MCP_TOOLS = [
-  { name: 'get_overview', description: 'Überblick: heutiges Datum, Personen, Teamziel der Woche, fällige Haushaltsaufgaben, offene To-dos, Essensplan dieser und nächster Woche, Gäste-Status, Gesundheits-Checkliste heute. Zuerst aufrufen, um den Kontext zu kennen.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => overview() },
+  { name: 'get_overview', description: 'Überblick: heutiges Datum, Personen, Teamziel der Woche, fällige Haushaltsaufgaben, offene To-dos, Essensplan dieser und nächster Woche, Gäste-Status, Gesundheits-Checkliste heute, offene Einkaufsliste. Zuerst aufrufen, um den Kontext zu kennen.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => overview() },
   { name: 'list_chores', description: 'Alle wiederkehrenden Haushaltsaufgaben mit Person, Rhythmus (Intervall oder Monatsregel), Punkten und Fälligkeit.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => q('SELECT * FROM chores ORDER BY name').all().map(choreView) },
   { name: 'add_chore', description: 'Neue wiederkehrende Haushaltsaufgabe anlegen, optional mit erstem Fälligkeitsdatum.', inputSchema: { type: 'object', properties: { name: P('string', 'Bezeichnung'), interval_days: P('integer', 'Alle wie viele Tage (1-365); bei Monatsregel weglassen'), monthly_nth: P('integer', 'Monatsregel statt Intervall: n-ter Wochentag im Monat (1-5, -1 = letzter; 0 entfernt die Regel)'), monthly_weekday: P('integer', 'Wochentag der Monatsregel, 1=Mo bis 7=So'), lead_days: P('integer', 'Monatsregel: so viele Tage vor dem Termin fällig/erinnern (0-14)'), remind_slot: P('string', 'Monatsregel: Erinnerung nur im Push morning oder evening, both = beide'), points: P('integer', 'Punkte fürs Teamziel (1-100), Standard 10'), assignee: P('string', 'Schlüssel der zuständigen Person (siehe get_overview.people)'), next_due: P('string', 'Erste Fälligkeit YYYY-MM-DD (optional, sonst sofort fällig)') }, required: ['name', 'assignee'] }, run: (u, a) => ops.choreAdd(u, a) },
   { name: 'update_chore', description: 'Haushaltsaufgabe ändern (nur angegebene Felder), auch die nächste Fälligkeit verschieben.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), name: P('string', 'Neue Bezeichnung'), interval_days: P('integer', 'Neues Intervall in Tagen'), monthly_nth: P('integer', 'Monatsregel statt Intervall: n-ter Wochentag im Monat (1-5, -1 = letzter; 0 entfernt die Regel)'), monthly_weekday: P('integer', 'Wochentag der Monatsregel, 1=Mo bis 7=So'), lead_days: P('integer', 'Monatsregel: so viele Tage vor dem Termin fällig/erinnern (0-14)'), remind_slot: P('string', 'Monatsregel: Erinnerung nur im Push morning oder evening, both = beide'), points: P('integer', 'Neue Punkte'), assignee: P('string', 'Neue zuständige Person'), next_due: P('string', 'Nächste Fälligkeit YYYY-MM-DD setzen (gilt bis zur nächsten Erledigung, danach wieder nach Intervall). Leerer String entfernt die manuelle Fälligkeit.') }, required: ['id'] }, run: (u, a) => ops.choreUpdate(a.id, a) },
@@ -787,8 +828,21 @@ const MCP_TOOLS = [
       const p = a.person ? actor(u, a) : null;
       return p ? healthStats(p, a.month) : Object.keys(USERS).map(k => healthStats(k, a.month));
     } },
+  { name: 'get_shopping_list', description: 'Gemeinsame Einkaufsliste: offene Artikel und die in den letzten 7 Tagen gekauften.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => { const l = shoppingList(); return { open: l.filter(i => !i.done), bought: l.filter(i => i.done) }; } },
+  { name: 'add_shopping_items', description: 'Einen oder mehrere Artikel auf die Einkaufsliste setzen, z.B. Zutaten aus dem Essensplan. Steht ein Artikel schon offen auf der Liste, wird nur die Menge ergänzt.', inputSchema: { type: 'object', properties: { items: { type: 'array', maxItems: 100, items: { type: 'object', properties: { name: P('string', 'Artikel, z.B. Milch'), qty: P('string', 'Menge, z.B. 2 l oder 500 g (optional)') }, required: ['name'] } }, person: PERSON }, required: ['items'] }, run: (u, a) => {
+      if (!Array.isArray(a.items) || !a.items.length) fail(400, 'items fehlt');
+      const who = actor(u, a, Object.keys(USERS)[0]);
+      return { ok: true, results: a.items.slice(0, 100).map(i => ({ name: i.name, ...ops.shopAdd(who, i) })) };
+    } },
+  { name: 'set_shopping_done', description: 'Artikel als gekauft markieren oder wieder auf offen setzen.', inputSchema: { type: 'object', properties: { ids: { type: 'array', items: { type: 'integer' }, description: 'IDs aus get_shopping_list' }, done: P('boolean', 'true = gekauft, false = wieder offen'), person: PERSON }, required: ['ids', 'done'] }, run: (u, a) => {
+      const who = actor(u, a, Object.keys(USERS)[0]);
+      return { ok: true, results: (a.ids || []).slice(0, 100).map(id => ({ id, ...ops.shopSetDone(who, id, !!a.done) })) };
+    } },
+  { name: 'update_shopping_item', description: 'Name oder Menge eines Artikels ändern.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID'), name: P('string', 'Neuer Name'), qty: P('string', 'Neue Menge, leerer String entfernt sie') }, required: ['id'] }, run: (u, a) => ops.shopUpdate(a.id, a) },
+  { name: 'remove_shopping_items', description: 'Artikel von der Liste löschen.', inputSchema: { type: 'object', properties: { ids: { type: 'array', items: { type: 'integer' }, description: 'IDs aus get_shopping_list' } }, required: ['ids'] }, destructive: true, run: (u, a) => ({ ok: true, results: (a.ids || []).slice(0, 100).map(id => ({ id, ...ops.shopDelete(id) })) }) },
+  { name: 'clear_bought_items', description: 'Alle als gekauft markierten Artikel von der Liste entfernen.', inputSchema: { type: 'object', properties: {} }, destructive: true, run: () => ops.shopClearDone() },
 ];
-const MCP_INSTRUCTIONS = 'Flechte ist die Haushalts-App eines Paares: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (Ziel: jede Woche jemand zu Gast) und ein gemeinsames Wochen-Teamziel in Punkten. Dazu gibt es eine tägliche Gesundheits-Checkliste pro Person mit Monatsstatistik sowie einen Verlauf und eine Monatsstatistik der Haushaltsaufgaben. Rufe zuerst get_overview auf. Daten sind auf Deutsch, Datumsformat YYYY-MM-DD, Zeitzone ' + TZ + '. Das Konto kann von beiden Personen gemeinsam genutzt werden: Gib bei Aktionen, die einer Person zugerechnet werden, den Parameter person an und frage nach, wenn nicht klar ist, wer gerade schreibt. Haushaltsaufgaben haben eine feste zuständige Person (assignee).';
+const MCP_INSTRUCTIONS = 'Flechte ist die Haushalts-App eines Paares: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (Ziel: jede Woche jemand zu Gast) und ein gemeinsames Wochen-Teamziel in Punkten. Dazu gibt es eine gemeinsame Einkaufsliste, eine tägliche Gesundheits-Checkliste pro Person mit Monatsstatistik sowie einen Verlauf und eine Monatsstatistik der Haushaltsaufgaben. Rufe zuerst get_overview auf. Daten sind auf Deutsch, Datumsformat YYYY-MM-DD, Zeitzone ' + TZ + '. Das Konto kann von beiden Personen gemeinsam genutzt werden: Gib bei Aktionen, die einer Person zugerechnet werden, den Parameter person an und frage nach, wenn nicht klar ist, wer gerade schreibt. Haushaltsaufgaben haben eine feste zuständige Person (assignee).';
 const mcpRate = new Map();
 async function handleMcp(req, res) {
   if (req.method === 'GET' || req.method === 'DELETE') return send(res, 405, { error: 'Nur POST' }, undefined, { Allow: 'POST' });
@@ -803,7 +857,7 @@ async function handleMcp(req, res) {
     const isNote = msg.id === undefined;
     const ok = result => isNote ? null : { jsonrpc: '2.0', id: msg.id, result };
     switch (msg.method) {
-      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.2.0' }, instructions: MCP_INSTRUCTIONS });
+      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.3.0' }, instructions: MCP_INSTRUCTIONS });
       case 'ping': return ok({});
       case 'tools/list': return ok({ tools: MCP_TOOLS.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, annotations: { readOnlyHint: !!t.readOnly, destructiveHint: !!t.destructive, openWorldHint: false } })) });
       case 'tools/call': {

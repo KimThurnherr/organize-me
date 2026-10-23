@@ -125,6 +125,7 @@ function render() {
   $('healthHomeCard').hidden = !S.healthToday.items.length;
   const hOpen = S.healthToday.items.filter(i => !i.done).length;
   $('badgeHealth').hidden = !hOpen; $('badgeHealth').textContent = hOpen;
+  renderShop();
   if (tab === 'health') renderHealth();
   if (tab === 'chores') renderChoreHist();
 
@@ -260,6 +261,37 @@ function renderMeals() {
 }
 
 // ---------- Gesundheit ----------
+// ---------- Einkauf ----------
+let shopKey = '';
+function renderShop() {
+  const open = S.shopping.filter(i => !i.done), done = S.shopping.filter(i => i.done);
+  $('badgeShop').hidden = !open.length; $('badgeShop').textContent = open.length;
+  const key = JSON.stringify(S.shopping) + '|' + pending;
+  if (key === shopKey) return; shopKey = key;
+  const dl = $('shopIdeas'); dl.innerHTML = ''; for (const n of S.shoppingSuggestions) dl.appendChild(new Option(n));
+  $('shOpenTitle').textContent = open.length ? 'Zu kaufen (' + open.length + ')' : 'Zu kaufen';
+  const row = (it) => {
+    const l = document.createElement('li'); l.className = 'shoprow';
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'check' + (it.done ? ' bought' : ''); b.setAttribute('aria-pressed', !!it.done);
+    b.innerHTML = '<span class="box">' + (it.done ? '✓' : '') + '</span><span class="lbl">' + esc(it.name) + '</span>' + (it.qty ? '<span class="qty">' + esc(it.qty) + '</span>' : '');
+    b.addEventListener('click', async () => {
+      if (busy) return; busy = true;
+      try { await call('POST', 'shopping/' + it.id + '/done', { done: !it.done }); } catch (e) { toast(e.message); }
+      busy = false; await load();
+    });
+    l.appendChild(b);
+    const x = pending === 's' + it.id ? btn('Löschen?', 'link danger x', () => { pending = null; act('DELETE', 'shopping/' + it.id, null, 'Entfernt'); }) : btn('×', 'link x', () => { pending = 's' + it.id; shopKey = ''; renderShop(); });
+    x.setAttribute('aria-label', 'Entfernen'); l.appendChild(x);
+    return l;
+  };
+  const ou = $('shopOpen'); ou.innerHTML = '';
+  for (const it of open) ou.appendChild(row(it));
+  if (!open.length) ou.appendChild(li('<p class="empty">Nichts auf der Liste.</p>'));
+  $('shopDoneCard').hidden = !done.length;
+  const du = $('shopDone'); du.innerHTML = '';
+  for (const it of done) du.appendChild(row(it));
+}
+
 function checkItem(it, date) {
   const l = document.createElement('li');
   const b = document.createElement('button'); b.type = 'button'; b.className = 'check'; b.setAttribute('aria-pressed', it.done);
@@ -413,6 +445,15 @@ $('visitForm').addEventListener('submit', async e => {
 $('settingsForm').addEventListener('submit', async e => { e.preventDefault(); await act('POST', 'settings', { morning: $('sMorning').value, evening: $('sEvening').value, teamGoal: +$('sGoal').value }, 'Gespeichert'); });
 $('logout').addEventListener('click', async () => { await fetch('/auth/logout', { method: 'POST' }); location.href = '/'; });
 for (const b of document.querySelectorAll('.tab')) b.addEventListener('click', () => { tab = b.dataset.tab; pending = null; editing = null; hEditing = null; render(); if (tab === 'health') loadHealth(); if (tab === 'chores') loadChoreHist(); });
+
+// Einkauf
+$('shopForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const name = $('shName').value.trim(); if (!name) return;
+  const d = await act('POST', 'shopping', { name, qty: $('shQty').value }, r => r.merged ? name + ' war schon auf der Liste' : name + ' hinzugefügt');
+  if (d) { $('shName').value = ''; $('shQty').value = ''; $('shName').focus(); }
+});
+$('shClear').addEventListener('click', () => act('POST', 'shopping/clear', null, r => r.removed + ' entfernt'));
 
 // Gesundheit & Verlauf
 $('toHealth').addEventListener('click', () => { tab = 'health'; render(); loadHealth(); });

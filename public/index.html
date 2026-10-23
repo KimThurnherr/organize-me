@@ -36,6 +36,7 @@
       <button class="tab" role="tab" data-tab="chores">Haushalt</button>
       <button class="tab" role="tab" data-tab="health">Gesundheit<span class="badge" id="badgeHealth" hidden></span></button>
       <button class="tab" role="tab" data-tab="meals">Essen</button>
+      <button class="tab" role="tab" data-tab="shop">Einkauf<span class="badge soft" id="badgeShop" hidden></span></button>
       <button class="tab" role="tab" data-tab="todos">To-dos</button>
       <button class="tab" role="tab" data-tab="guests">Gäste</button>
       <button class="tab" role="tab" data-tab="settings">Einstellungen</button>
@@ -145,6 +146,27 @@
         <div><button class="primary" type="submit">Plan speichern</button></div>
       </form>
       <datalist id="mealIdeas"></datalist>
+    </section>
+
+    <!-- Einkauf -->
+    <section data-panel="shop" class="panel" hidden>
+      <div><h2>Einkaufsliste</h2><p class="hint">Gemeinsame Liste. Antippen hakt ab, gekaufte Artikel bleiben 7 Tage sichtbar.</p></div>
+      <form class="card" id="shopForm">
+        <div class="row">
+          <label class="grow" for="shName">Artikel<input type="text" id="shName" list="shopIdeas" maxlength="80" required autocomplete="off" placeholder="z.B. Milch"></label>
+          <label for="shQty" style="flex:0 1 110px">Menge<input type="text" id="shQty" maxlength="30" autocomplete="off" placeholder="2 l"></label>
+          <button class="primary" type="submit">Hinzufügen</button>
+        </div>
+        <datalist id="shopIdeas"></datalist>
+      </form>
+      <div class="card">
+        <div class="goal-head"><h2 id="shOpenTitle">Zu kaufen</h2></div>
+        <ul class="checks" id="shopOpen"></ul>
+      </div>
+      <div class="card" id="shopDoneCard" hidden>
+        <div class="goal-head"><h2>Gekauft</h2><button class="link" type="button" id="shClear">Gekaufte entfernen</button></div>
+        <ul class="checks" id="shopDone"></ul>
+      </div>
     </section>
 
     <!-- To-dos -->

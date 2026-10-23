@@ -125,3 +125,11 @@ dialog.confirm { border: 1px solid var(--line); border-radius: 14px; background:
 dialog.confirm::backdrop { background: rgb(0 0 0 / .4); }
 dialog.confirm form { display: grid; gap: 8px; }
 dialog.confirm .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+
+.badge.soft { background: var(--accent); }
+.check .qty { color: var(--muted); font-weight: 600; font-size: .9rem; white-space: nowrap; }
+.check.bought { opacity: .65; }
+.check.bought .lbl { text-decoration: line-through; }
+.shoprow { display: flex; align-items: center; gap: 4px; }
+.shoprow .check { flex: 1; min-width: 0; }
+.shoprow .x { flex: none; font-size: 1.2rem; padding: 6px 10px; color: var(--muted); }
