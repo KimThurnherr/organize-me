@@ -119,3 +119,9 @@ table.stats td.n { text-align: right; white-space: nowrap; }
 table.stats td.name { min-width: 9em; }
 .bad-t { color: var(--bad); } .ok-t { color: var(--ok); } .warn-t { color: var(--warn); }
 details summary { cursor: pointer; color: var(--accent); font-weight: 600; padding: 4px 0; }
+
+/* Bestätigung vor dem Abhaken */
+dialog.confirm { border: 1px solid var(--line); border-radius: 14px; background: var(--surface); color: var(--fg); padding: 20px; width: min(340px, calc(100vw - 32px)); box-shadow: 0 12px 40px rgb(0 0 0 / .25); }
+dialog.confirm::backdrop { background: rgb(0 0 0 / .4); }
+dialog.confirm form { display: grid; gap: 8px; }
+dialog.confirm .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }

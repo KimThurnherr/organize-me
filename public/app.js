@@ -19,6 +19,18 @@ const ago = n => n === 0 ? 'heute' : n === 1 ? 'gestern' : 'vor ' + n + ' Tagen'
 function toast(t) { const el = $('toast'); el.textContent = t; el.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => el.hidden = true, 2600); }
 function li(html, cls) { const l = document.createElement('li'); if (cls) l.className = cls; l.innerHTML = html; return l; }
 function btn(text, cls, fn) { const b = document.createElement('button'); b.type = 'button'; b.className = cls; b.textContent = text; b.addEventListener('click', fn); return b; }
+// Kurze Rückfrage vor dem Abhaken, damit nichts aus Versehen erledigt wird
+function askConfirm(title, text, okLabel = 'Ja, erledigt') {
+  return new Promise(resolve => {
+    const d = document.createElement('dialog'); d.className = 'confirm';
+    d.innerHTML = '<form method="dialog"><h2></h2><p class="hint"></p><div class="row"><button value="no" class="ghost" type="submit">Abbrechen</button><button value="yes" class="primary" type="submit"></button></div></form>';
+    d.querySelector('h2').textContent = title; d.querySelector('p').textContent = text || ''; d.querySelector('.primary').textContent = okLabel;
+    d.addEventListener('close', () => { resolve(d.returnValue === 'yes'); d.remove(); });
+    d.addEventListener('click', e => { if (e.target === d) d.close('no'); });
+    document.body.appendChild(d); d.showModal(); d.querySelector('.primary').focus();
+  });
+}
+const doneBtn = (name, fn) => btn('Erledigt', 'done', async () => { if (await askConfirm(name, 'Als erledigt markieren?')) fn(); });
 function confirmBtn(key, label, ask, fn) {
   if (pending === key) return btn(ask, 'link danger', () => { pending = null; fn(); });
   return btn(label, 'link', () => { pending = key; render(); });
@@ -71,8 +83,8 @@ function fillSelect(sel, withBoth) {
 
 function dueItem(kind, item, sub) {
   const l = li('<div class="who"><b>' + esc(item.name || item.title) + '</b><div>' + sub + '</div></div>' + (kind === 'chore' ? '<span class="pts">+' + item.points + '</span>' : ''));
-  if (kind === 'chore') l.appendChild(btn('Erledigt', 'done', () => act('POST', 'chores/' + item.id + '/done', null, d => '+' + d.points + ' Punkte fürs Team')));
-  else l.appendChild(btn('Erledigt', 'done', () => act('POST', 'todos/' + item.id + '/toggle', null, '+5 Punkte fürs Team')));
+  if (kind === 'chore') l.appendChild(doneBtn(item.name, () => act('POST', 'chores/' + item.id + '/done', null, d => '+' + d.points + ' Punkte fürs Team')));
+  else l.appendChild(doneBtn(item.title, () => act('POST', 'todos/' + item.id + '/toggle', null, '+5 Punkte fürs Team')));
   return l;
 }
 
@@ -155,7 +167,7 @@ function render() {
   for (const { c, s } of order) {
     if (editing === c.id) { cl.appendChild(editRow(c)); continue; }
     const l = li('<div class="who"><b>' + esc(c.name) + '</b><div><span class="pill ' + s.cls + '">' + s.text + '</span> · ' + esc(NAME(c.assignee)) + ' · ' + esc(c.rule || ('alle ' + c.interval_days + ' Tage')) + (c.event_date ? ' · nächster Termin ' + fmt(c.event_date) : '') + (c.last_done && c.last_by ? ' · zuletzt ' + fmt(c.last_done) : '') + '</div></div><span class="pts">+' + c.points + '</span>');
-    if (c.last_done !== S.today) l.appendChild(btn('Erledigt', 'done', () => act('POST', 'chores/' + c.id + '/done', null, d => '+' + d.points + ' Punkte fürs Team')));
+    if (c.last_done !== S.today) l.appendChild(doneBtn(c.name, () => act('POST', 'chores/' + c.id + '/done', null, d => '+' + d.points + ' Punkte fürs Team')));
     l.appendChild(btn('Ändern', 'link', () => { editing = c.id; pending = null; render(); }));
     cl.appendChild(l);
   }
@@ -167,7 +179,8 @@ function render() {
     const late = !t.done && t.due && daysSince(t.due) > 0;
     const sub = t.done ? 'erledigt von ' + esc(NAME(t.done_by)) : [t.assignee ? 'für ' + esc(NAME(t.assignee)) : 'für beide', t.due ? (late ? '<span class="pill bad">überfällig seit ' + fmt(t.due) + '</span>' : 'bis ' + fmt(t.due)) : ''].filter(Boolean).join(' · ');
     const l = li('<div class="who"><b>' + esc(t.title) + '</b><div>' + sub + '</div></div>', t.done ? 'isdone' : '');
-    l.appendChild(btn(t.done ? 'Wieder öffnen' : 'Erledigt', t.done ? 'link' : 'done', () => act('POST', 'todos/' + t.id + '/toggle', null, t.done ? 'Wieder offen' : '+5 Punkte fürs Team')));
+    const toggle = () => act('POST', 'todos/' + t.id + '/toggle', null, t.done ? 'Wieder offen' : '+5 Punkte fürs Team');
+    l.appendChild(t.done ? btn('Wieder öffnen', 'link', toggle) : doneBtn(t.title, toggle));
     l.appendChild(confirmBtn('t' + t.id, 'Löschen', 'Wirklich löschen?', () => act('DELETE', 'todos/' + t.id, null, 'To-do gelöscht')));
     tl.appendChild(l);
   }
