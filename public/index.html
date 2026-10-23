@@ -163,7 +163,7 @@
 
     <!-- Gäste -->
     <section data-panel="guests" class="panel" hidden>
-      <div><h2>Besuch eintragen</h2><p class="hint">Ziel: jede Woche jemand zu Gast. Ein Besuch gibt 10 Punkte pro Person.</p></div>
+      <div><h2>Besuch eintragen oder planen</h2><p class="hint">Ziel: jede Woche jemand zu Gast. Ein Besuch gibt 10 Punkte pro Person. Mit einem Datum in der Zukunft wird er geplant, die Punkte kommen dann am Besuchstag.</p></div>
       <form class="card" id="visitForm">
         <label for="vDate">Datum<input type="date" id="vDate" required></label>
         <div class="chips" id="vGuests"></div>
@@ -171,6 +171,7 @@
         <label for="vNote">Notiz (optional)<input type="text" id="vNote" maxlength="200" placeholder="z.B. Raclette-Abend"></label>
         <div><button class="primary" type="submit">Besuch speichern</button></div>
       </form>
+      <div id="plannedBox" hidden><h2>Geplant</h2><div class="card"><ul class="list" id="planned"></ul></div></div>
       <div><h2>Wen als Nächstes einladen?</h2><p class="hint">Am längsten nicht mehr bei euch zuoberst.</p></div>
       <div class="card"><ul class="list" id="suggest"></ul></div>
       <form class="card" id="personForm">

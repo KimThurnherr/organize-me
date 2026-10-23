@@ -73,7 +73,10 @@ function choreState(c) {
   if (left === 0) return { due: true, over: 0, text: 'heute fällig', cls: 'warn' };
   return { due: true, over: -left, text: 'seit ' + (-left) + (left === -1 ? ' Tag' : ' Tagen') + ' überfällig', cls: 'bad' };
 }
-const lastVisitOf = gid => { for (const v of S.visits) if (v.guestIds.includes(gid)) return v.date; return null; };
+const pastVisits = () => S.visits.filter(v => v.date <= S.today);
+const plannedVisits = () => S.visits.filter(v => v.date > S.today).sort((a, b) => a.date < b.date ? -1 : 1);
+const lastVisitOf = gid => { for (const v of pastVisits()) if (v.guestIds.includes(gid)) return v.date; return null; };
+const nextVisitOf = gid => plannedVisits().find(v => v.guestIds.includes(gid))?.date || null;
 function fillSelect(sel, withBoth) {
   const cur = sel.value; sel.innerHTML = '';
   if (withBoth) sel.add(new Option('Beide', ''));
@@ -144,7 +147,7 @@ function render() {
   }
 
   // Gäste-Status
-  const last = S.visits[0]?.date;
+  const last = pastVisits()[0]?.date, nextV = plannedVisits()[0];
   const gpill = $('guestPill');
   if (!last) { $('guestBig').textContent = '–'; gpill.className = 'pill warn'; gpill.textContent = 'Noch kein Besuch eingetragen'; }
   else {
@@ -153,6 +156,7 @@ function render() {
     const [c, t] = n < 5 ? ['ok', 'Alles im Rhythmus'] : n < 7 ? ['warn', 'Bald wieder jemanden einladen'] : ['bad', 'Überfällig, Zeit für eine Einladung'];
     gpill.className = 'pill ' + c; gpill.textContent = t;
   }
+  if (nextV) { gpill.className = 'pill ok'; gpill.textContent = 'Nächster Besuch geplant: ' + fmt(nextV.date); }
 
   // Lange nicht gesehen
   $('absentBox').hidden = !S.longAbsent.length;
@@ -193,14 +197,22 @@ function render() {
   const ranked = S.guests.map(g => ({ g, last: lastVisitOf(g.id) })).sort((a, b) => (a.last ? dayNum(a.last) : -1e9) - (b.last ? dayNum(b.last) : -1e9));
   if (!ranked.length) sg.appendChild(li('<p class="empty">Sobald Freunde erfasst sind, erscheinen hier Vorschläge.</p>'));
   for (const { g, last } of ranked) {
-    const l = li('<div class="who"><b>' + esc(g.name) + '</b><div>' + (last ? 'zuletzt am ' + fmt(last) + ', ' + ago(daysSince(last)) : 'noch nie eingetragen') + '</div></div>');
+    const nx = nextVisitOf(g.id);
+    const l = li('<div class="who"><b>' + esc(g.name) + '</b><div>' + (last ? 'zuletzt am ' + fmt(last) + ', ' + ago(daysSince(last)) : 'noch nie eingetragen') + (nx ? ' · <span class="pill">geplant am ' + fmt(nx) + '</span>' : '') + '</div></div>');
     l.appendChild(confirmBtn('g' + g.id, 'Entfernen', 'Wirklich entfernen?', () => act('DELETE', 'guests/' + g.id, null, 'Person entfernt')));
     sg.appendChild(l);
   }
+  const pl = $('planned'); pl.innerHTML = '';
+  $('plannedBox').hidden = !plannedVisits().length;
+  for (const v of plannedVisits()) {
+    const l = li('<div class="who"><b>' + esc(v.guestIds.map(id => S.guests.find(g => g.id === id)?.name || 'Entfernte Person').join(', ') || 'Ohne Namen') + '</b><div>' + fmt(v.date) + ', ' + (dayNum(v.date) - dayNum(S.today) === 1 ? 'morgen' : 'in ' + (dayNum(v.date) - dayNum(S.today)) + ' Tagen') + (v.note ? ' · ' + esc(v.note) : '') + '</div></div>');
+    l.appendChild(confirmBtn('v' + v.id, 'Absagen', 'Wirklich absagen?', () => act('DELETE', 'visits/' + v.id, null, 'Besuch abgesagt')));
+    pl.appendChild(l);
+  }
   const h = $('history'); h.innerHTML = '';
-  if (!S.visits.length) h.appendChild(li('<p class="empty">Noch keine Besuche.</p>'));
+  if (!pastVisits().length) h.appendChild(li('<p class="empty">Noch keine Besuche.</p>'));
   const gname = id => S.guests.find(g => g.id === id)?.name || 'Entfernte Person';
-  for (const v of S.visits.slice(0, 30)) {
+  for (const v of pastVisits().slice(0, 30)) {
     const l = li('<div class="who"><b>' + esc(v.guestIds.map(gname).join(', ') || 'Ohne Namen') + '</b><div>' + fmt(v.date) + (v.note ? ' · ' + esc(v.note) : '') + '</div></div>');
     l.appendChild(confirmBtn('v' + v.id, 'Löschen', 'Wirklich löschen?', () => act('DELETE', 'visits/' + v.id, null, 'Besuch gelöscht')));
     h.appendChild(l);
@@ -208,7 +220,7 @@ function render() {
 
   // Formulare
   fillSelect($('cWho'), false); fillSelect($('tWho'), true);
-  if (!$('vDate').value) { $('vDate').value = S.today; } $('vDate').max = S.today;
+  if (!$('vDate').value) { $('vDate').value = S.today; } $('vDate').max = dstrN(dayNum(S.today) + 365);
   if (document.activeElement?.closest('#settingsForm') == null) {
     $('sMorning').value = S.settings.morning; $('sEvening').value = S.settings.evening; $('sGoal').value = S.teamGoal;
   }
@@ -395,7 +407,7 @@ $('personForm').addEventListener('submit', async e => { e.preventDefault(); cons
 $('visitForm').addEventListener('submit', async e => {
   e.preventDefault();
   if (!selected.size) return toast('Bitte mindestens eine Person antippen');
-  const d = await act('POST', 'visits', { date: $('vDate').value, guestIds: [...selected], note: $('vNote').value }, 'Besuch gespeichert, je +10 Punkte');
+  const d = await act('POST', 'visits', { date: $('vDate').value, guestIds: [...selected], note: $('vNote').value }, r => r.planned ? 'Besuch geplant, Punkte gibt es am Besuchstag' : 'Besuch gespeichert, je +10 Punkte');
   if (d) { selected.clear(); $('vNote').value = ''; $('vDate').value = S.today; render(); }
 });
 $('settingsForm').addEventListener('submit', async e => { e.preventDefault(); await act('POST', 'settings', { morning: $('sMorning').value, evening: $('sEvening').value, teamGoal: +$('sGoal').value }, 'Gespeichert'); });

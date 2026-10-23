@@ -227,6 +227,7 @@ function serveStatic(res, rel) {
 
 // ---------- Zustand für das Frontend ----------
 function state(user) {
+  awardDueVisits();
   return {
     me: user,
     users: Object.keys(USERS).map(k => ({ key: k, name: USER_NAMES[k] || k.charAt(0).toUpperCase() + k.slice(1) })),
@@ -251,6 +252,13 @@ function state(user) {
 function addLog(by, points, type, label, ref, date) {
   q('INSERT INTO log(by,points,type,label,ref,date,at) VALUES(?,?,?,?,?,?,?)').run(by, points, type, label, String(ref ?? ''), date || localNow().date, new Date().toISOString());
 }
+
+// Geplante Besuche: Punkte gibt es erst, wenn der Besuchstag erreicht ist
+function awardDueVisits() {
+  const due = q("SELECT id, date FROM visits v WHERE date <= ? AND NOT EXISTS (SELECT 1 FROM log l WHERE l.type='visit' AND l.ref=CAST(v.id AS TEXT))").all(localNow().date);
+  for (const v of due) for (const u of Object.keys(USERS)) addLog(u, 10, 'visit', 'Gäste', v.id, v.date);
+}
+const nextPlannedVisit = () => q('SELECT id, date FROM visits WHERE date > ? ORDER BY date, id LIMIT 1').get(localNow().date) || null;
 
 // ---------- Fachlogik (von Web-API und MCP gemeinsam genutzt) ----------
 class OpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
@@ -350,14 +358,17 @@ const ops = {
   visitAdd(user, b) {
     const date = str(b.date, 10), note = str(b.note, 200), today = localNow().date;
     const ids = Array.isArray(b.guestIds) ? [...new Set(b.guestIds.map(Number).filter(Number.isInteger))].slice(0, 30) : [];
-    if (!isDate(date) || dayNum(date) > dayNum(today)) fail(400, 'Ungültiges Datum (nicht in der Zukunft)');
+    if (!isDate(date)) fail(400, 'Ungültiges Datum');
+    if (dayNum(date) > dayNum(today) + 365) fail(400, 'Höchstens ein Jahr im Voraus planen.');
+    const planned = dayNum(date) > dayNum(today);
     const valid = ids.filter(g => q('SELECT 1 FROM guests WHERE id=?').get(g));
     if (!valid.length) fail(400, 'Bitte mindestens eine erfasste Person angeben.');
     const r = q('INSERT INTO visits(date,note,by,created_at) VALUES(?,?,?,?)').run(date, note, user, nowIso());
     const vid = Number(r.lastInsertRowid);
     for (const g of valid) q('INSERT OR IGNORE INTO visit_guests(visit_id,guest_id) VALUES(?,?)').run(vid, g);
+    if (planned) return { ok: true, id: vid, planned: true, points: 0 };
     for (const u of Object.keys(USERS)) addLog(u, 10, 'visit', 'Gäste', vid, date);
-    return { ok: true, id: vid, points: 10 };
+    return { ok: true, id: vid, planned: false, points: 10 };
   },
   visitDelete(id) { if (!q('SELECT 1 FROM visits WHERE id=?').get(+id)) fail(404, 'Besuch nicht gefunden'); q('DELETE FROM visits WHERE id=?').run(+id); q("DELETE FROM log WHERE type='visit' AND ref=?").run(String(+id)); return { ok: true }; },
   healthItemGet(id) { const h = q('SELECT * FROM health_items WHERE id=?').get(+id); if (!h) fail(404, 'Eintrag nicht gefunden'); return h; },
@@ -575,14 +586,17 @@ function dueFor(user) {
   const today = localNow().date;
   const chores = q('SELECT * FROM chores WHERE assignee=?').all(user).filter(c => choreDueIn(c) <= 0);
   const todos = q('SELECT * FROM todos WHERE done=0 AND due IS NOT NULL AND due <= ? AND (assignee IS NULL OR assignee=?)').all(today, user);
-  const lastVisit = q('SELECT date FROM visits ORDER BY date DESC LIMIT 1').get()?.date;
+  const lastVisit = q('SELECT date FROM visits WHERE date <= ? ORDER BY date DESC LIMIT 1').get(today)?.date;
   const guestDays = lastVisit ? daysSince(lastVisit) : null;
-  return { chores, todos, guestOverdue: guestDays === null ? false : guestDays >= 7, guestDays };
+  const next = nextPlannedVisit();
+  return { chores, todos, guestOverdue: guestDays === null || next ? false : guestDays >= 7, guestDays, nextVisit: next };
 }
 // Freunde, die seit GUEST_REMIND_DAYS nicht mehr da waren (ohne Besuch: ab Erfassungsdatum)
 function longAbsentGuests() {
   const today = dayNum(localNow().date);
-  return q('SELECT g.id, g.name, g.created_at, (SELECT max(v.date) FROM visits v JOIN visit_guests vg ON vg.visit_id=v.id WHERE vg.guest_id=g.id) AS last_visit FROM guests g').all()
+  const td = localNow().date;
+  return q('SELECT g.id, g.name, g.created_at, (SELECT max(v.date) FROM visits v JOIN visit_guests vg ON vg.visit_id=v.id WHERE vg.guest_id=g.id AND v.date <= ?) AS last_visit, (SELECT min(v.date) FROM visits v JOIN visit_guests vg ON vg.visit_id=v.id WHERE vg.guest_id=g.id AND v.date > ?) AS next_visit FROM guests g').all(td, td)
+    .filter(g => !g.next_visit)
     .map(g => { const since = g.last_visit || (g.created_at || '').slice(0, 10); return { id: g.id, name: g.name, last_visit: g.last_visit, days: isDate(since) ? today - dayNum(since) : 0 }; })
     .filter(g => g.days >= GUEST_REMIND_DAYS).sort((a, b) => b.days - a.days);
 }
@@ -597,6 +611,10 @@ function buildMessage(user, slot) {
   if (d.todos.length) lines.push((d.todos.length === 1 ? 'To-do: ' : `${d.todos.length} To-dos: `) + d.todos.slice(0, 3).map(t => t.title).join(', ') + (d.todos.length > 3 ? ' …' : ''));
   if (d.guestOverdue) lines.push(`Seit ${d.guestDays} Tagen kein Besuch. Wen ladet ihr ein?`);
   const today = localNow().date, dnum = dayNum(today);
+  if (slot === 'morning') {
+    const vt = q('SELECT DISTINCT g.name FROM visits v JOIN visit_guests vg ON vg.visit_id=v.id JOIN guests g ON g.id=vg.guest_id WHERE v.date=? ORDER BY g.name').all(today).map(r => r.name);
+    if (vt.length) lines.push('Heute zu Gast: ' + vt.join(', '));
+  }
   if (slot === 'evening') {
     const due = longAbsentGuests().filter(g => { const r = q('SELECT date FROM guest_reminders WHERE guest_id=? AND user=?').get(g.id, user); return !r || dnum - dayNum(r.date) >= GUEST_REMIND_REPEAT; });
     if (due.length) {
@@ -639,7 +657,7 @@ async function scheduler() {
   }
   q('DELETE FROM push_sent WHERE date < ?').run(new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10));
 }
-setInterval(() => scheduler().catch(e => console.error('Scheduler', e)), 60 * 1000);
+setInterval(() => { try { awardDueVisits(); } catch (e) { console.error('Besuchspunkte', e); } scheduler().catch(e => console.error('Scheduler', e)); }, 60 * 1000);
 
 // ---------- Google-Login ----------
 const REDIRECT_URI = PUBLIC_URL + '/auth/callback';
@@ -703,7 +721,9 @@ function overview() {
   const pts = w => log.filter(e => weekStart(e.date) === w).reduce((a, e) => a + e.points, 0);
   let streak = 0; for (let w = ws - 7; ; w -= 7) { if (pts(w) >= goal) streak++; else break; }
   const chores = q('SELECT * FROM chores ORDER BY name').all().map(choreView);
-  const lastVisit = q('SELECT date FROM visits ORDER BY date DESC LIMIT 1').get()?.date || null;
+  awardDueVisits();
+  const lastVisit = q('SELECT date FROM visits WHERE date <= ? ORDER BY date DESC LIMIT 1').get(today)?.date || null;
+  const planned = q('SELECT id, date, note FROM visits WHERE date > ? ORDER BY date, id').all(today).map(v => ({ ...v, guests: q('SELECT g.name FROM visit_guests vg JOIN guests g ON g.id=vg.guest_id WHERE vg.visit_id=?').all(v.id).map(r => r.name) }));
   return {
     today, weekday: wdOf(today),
     people: Object.keys(USERS).map(k => ({ key: k, name: nameOf(k) })),
@@ -712,7 +732,7 @@ function overview() {
     open_todos: q('SELECT id, title, due, assignee FROM todos WHERE done=0 ORDER BY COALESCE(due, \'9999\'), id').all(),
     meals: q('SELECT date, title, note FROM meals WHERE date >= ? AND date <= ? ORDER BY date').all(dateStr(ws), dateStr(ws + 13)).map(m => ({ ...m, weekday: wdOf(m.date) })),
     health_today: Object.keys(USERS).map(k => healthDay(k, today)),
-    guests: { last_visit: lastVisit, days_since: lastVisit ? dayNum(today) - dayNum(lastVisit) : null, goal: 'jede Woche jemand zu Gast', long_absent: longAbsentGuests(), long_absent_threshold_days: GUEST_REMIND_DAYS },
+    guests: { last_visit: lastVisit, planned_visits: planned, days_since: lastVisit ? dayNum(today) - dayNum(lastVisit) : null, goal: 'jede Woche jemand zu Gast', long_absent: longAbsentGuests(), long_absent_threshold_days: GUEST_REMIND_DAYS },
   };
 }
 const P = (type, description, extra = {}) => ({ type, description, ...extra });
@@ -737,11 +757,11 @@ const MCP_TOOLS = [
       if (!Array.isArray(a.meals) || !a.meals.length) fail(400, 'meals fehlt');
       return { ok: true, results: a.meals.slice(0, 31).map(m => ({ date: m.date, ...ops.mealSet(who, m.date, m.title, m.note) })) };
     } },
-  { name: 'list_guests', description: 'Erfasste Freunde mit letztem Besuch, sortiert nach «am längsten nicht mehr da».', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => q('SELECT g.id, g.name, (SELECT max(v.date) FROM visits v JOIN visit_guests vg ON vg.visit_id=v.id WHERE vg.guest_id=g.id) AS last_visit FROM guests g ORDER BY last_visit IS NOT NULL, last_visit, g.name').all() },
+  { name: 'list_guests', description: 'Erfasste Freunde mit letztem Besuch, sortiert nach «am längsten nicht mehr da».', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => { const td = localNow().date; return q('SELECT g.id, g.name, (SELECT max(v.date) FROM visits v JOIN visit_guests vg ON vg.visit_id=v.id WHERE vg.guest_id=g.id AND v.date <= ?) AS last_visit, (SELECT min(v.date) FROM visits v JOIN visit_guests vg ON vg.visit_id=v.id WHERE vg.guest_id=g.id AND v.date > ?) AS next_planned FROM guests g ORDER BY last_visit IS NOT NULL, last_visit, g.name').all(td, td); } },
   { name: 'add_guest', description: 'Freund oder Paar zur Gästeliste hinzufügen.', inputSchema: { type: 'object', properties: { name: P('string', 'Name') }, required: ['name'] }, run: (u, a) => ops.guestAdd(a) },
   { name: 'delete_guest', description: 'Person aus der Gästeliste entfernen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID') }, required: ['id'] }, destructive: true, run: (u, a) => ops.guestDelete(a.id) },
-  { name: 'log_visit', description: 'Besuch eintragen (gibt beiden Personen je 10 Punkte).', inputSchema: { type: 'object', properties: { date: P('string', 'YYYY-MM-DD, nicht in der Zukunft'), guest_ids: { type: 'array', items: { type: 'integer' }, description: 'IDs aus list_guests' }, note: P('string', 'Notiz (optional)'), person: PERSON }, required: ['date', 'guest_ids'] }, run: (u, a) => ops.visitAdd(actor(u, a, Object.keys(USERS)[0]), { date: a.date, guestIds: a.guest_ids, note: a.note }) },
-  { name: 'list_visits', description: 'Letzte Besuche.', inputSchema: { type: 'object', properties: { limit: P('integer', 'Anzahl, Standard 20') } }, readOnly: true, run: (u, a) => q('SELECT id, date, note FROM visits ORDER BY date DESC, id DESC LIMIT ?').all(int(a.limit, 1, 200) || 20).map(v => ({ ...v, guests: q('SELECT g.name FROM visit_guests vg JOIN guests g ON g.id=vg.guest_id WHERE vg.visit_id=?').all(v.id).map(r => r.name) })) },
+  { name: 'log_visit', description: 'Besuch eintragen oder planen. Vergangene/heutige Besuche geben beiden Personen sofort je 10 Punkte; Besuche in der Zukunft gelten als geplant, die Punkte kommen automatisch am Besuchstag.', inputSchema: { type: 'object', properties: { date: P('string', 'YYYY-MM-DD, Zukunft = geplant (max. 1 Jahr voraus)'), guest_ids: { type: 'array', items: { type: 'integer' }, description: 'IDs aus list_guests' }, note: P('string', 'Notiz (optional)'), person: PERSON }, required: ['date', 'guest_ids'] }, run: (u, a) => ops.visitAdd(actor(u, a, Object.keys(USERS)[0]), { date: a.date, guestIds: a.guest_ids, note: a.note }) },
+  { name: 'list_visits', description: 'Besuche inkl. geplanter (planned=true), neueste zuerst.', inputSchema: { type: 'object', properties: { limit: P('integer', 'Anzahl, Standard 20') } }, readOnly: true, run: (u, a) => q('SELECT id, date, note FROM visits ORDER BY date DESC, id DESC LIMIT ?').all(int(a.limit, 1, 200) || 20).map(v => ({ ...v, planned: v.date > localNow().date, guests: q('SELECT g.name FROM visit_guests vg JOIN guests g ON g.id=vg.guest_id WHERE vg.visit_id=?').all(v.id).map(r => r.name) })) },
   { name: 'delete_visit', description: 'Besuch löschen (Punkte werden zurückgenommen).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID') }, required: ['id'] }, destructive: true, run: (u, a) => ops.visitDelete(a.id) },
   { name: 'get_settings', description: 'Push-Zeiten beider Personen und Teamziel.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => ({ push_times: Object.keys(USERS).map(k => ({ person: k, ...(q('SELECT morning, evening FROM user_settings WHERE user=?').get(k) || { morning: '09:00', evening: '18:00' }) })), team_goal: +meta.get('team_goal', 120) }) },
   { name: 'update_settings', description: 'Push-Zeiten (HH:MM) einer Person und/oder das gemeinsame Wochen-Teamziel ändern. Für Push-Zeiten ist person nötig.', inputSchema: { type: 'object', properties: { person: PERSON, morning: P('string', 'HH:MM'), evening: P('string', 'HH:MM'), team_goal: P('integer', 'Punkte pro Woche (10-2000)') } }, run: (u, a) => {
