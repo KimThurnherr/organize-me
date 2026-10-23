@@ -1,6 +1,6 @@
 # Flechte
 
-Kleine Haushalts-PWA für zwei Personen: wiederkehrende Aufgaben mit fester Zuständigkeit samt Verlauf und Monatsstatistik, tägliche Gesundheits-Checkliste pro Person mit Monatsstatistik, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (jede Woche jemand zu Gast), gemeinsames Wochenziel mit Punkten und Serie, Web-Push morgens und abends und eine MCP-Schnittstelle, über die sich alles aus einem KI-Assistenten heraus pflegen lässt.
+Kleine Haushalts-PWA für zwei Personen: wiederkehrende Aufgaben mit fester Zuständigkeit (alle n Tage oder als Monatsregel wie «jeden 1. Mittwoch, Erinnerung am Vorabend») samt Verlauf und Monatsstatistik, tägliche Gesundheits-Checkliste pro Person mit Monatsstatistik, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (jede Woche jemand zu Gast), gemeinsames Wochenziel mit Punkten und Serie, Web-Push morgens und abends und eine MCP-Schnittstelle, über die sich alles aus einem KI-Assistenten heraus pflegen lässt.
 
 Ohne externe Abhängigkeiten: Node 24 (`node:http`, `node:sqlite`, `node:crypto`). Web-Push (RFC 8291/8292) ist selbst implementiert, VAPID-Schlüssel und Session-Secret werden beim ersten Start erzeugt und im Datenvolume gespeichert.
 

@@ -49,6 +49,10 @@ CREATE TABLE IF NOT EXISTS meals (date TEXT PRIMARY KEY, title TEXT NOT NULL, no
 `);
 const q = (sql) => db.prepare(sql);
 try { db.exec('ALTER TABLE chores ADD COLUMN due_override TEXT'); } catch { /* Spalte existiert schon */ }
+// Monatsregel: n-ter Wochentag im Monat (month_nth 1-5 oder -1 = letzter, month_wday 1=Mo..7=So), Erinnerung lead_days vorher
+for (const col of ['month_nth INTEGER', 'month_wday INTEGER', 'lead_days INTEGER NOT NULL DEFAULT 0', 'remind_slot TEXT']) {
+  try { db.exec('ALTER TABLE chores ADD COLUMN ' + col); } catch { /* Spalte existiert schon */ }
+}
 const meta = {
   get: (k, d) => { const r = q('SELECT v FROM meta WHERE k=?').get(k); return r ? r.v : d; },
   set: (k, v) => q('INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v').run(k, String(v)),
@@ -109,8 +113,46 @@ const dayNum = s => { const [y, m, d] = s.split('-').map(Number); return Date.UT
 const daysSince = s => dayNum(localNow().date) - dayNum(s);
 const weekStart = s => { const n = dayNum(s); return n - ((new Date(n * 864e5).getUTCDay() + 6) % 7); };
 const dateStr = n => new Date(n * 864e5).toISOString().slice(0, 10);
+// Monatsregel: Tag (dayNum) des n-ten Wochentags in Jahr/Monat (m 0-11), null wenn es ihn nicht gibt (z.B. 5. Mittwoch)
+function nthWeekday(y, m, nth, wday) {
+  const jsW = wday % 7; // 1=Mo..7=So -> 0=So..6=Sa
+  if (nth === -1) { const last = Date.UTC(y, m + 1, 0) / 864e5; return last - ((new Date(last * 864e5).getUTCDay() - jsW + 7) % 7); }
+  const first = Date.UTC(y, m, 1) / 864e5, d = first + ((jsW - new Date(first * 864e5).getUTCDay() + 7) % 7) + (nth - 1) * 7;
+  return new Date(d * 864e5).getUTCMonth() === m ? d : null;
+}
+// Nächster Termin (Ereignis und Fälligkeit = Ereignis minus Vorlauf) einer Aufgabe mit Monatsregel.
+// Eine Erledigung zählt für den Termin, wenn sie höchstens eine Woche vor der Fälligkeit liegt.
+function monthlyNext(c) {
+  const today = dayNum(localNow().date), lead = c.lead_days || 0;
+  const after = c.last_done ? dayNum(c.last_done) + 7 : today - 1; // Fälligkeit muss danach liegen
+  const t = new Date(Math.min(after, today) * 864e5);
+  for (let i = -1; i < 15; i++) {
+    const y = t.getUTCFullYear(), m = t.getUTCMonth() + i;
+    const ev = nthWeekday(new Date(Date.UTC(y, m, 1)).getUTCFullYear(), new Date(Date.UTC(y, m, 1)).getUTCMonth(), c.month_nth, c.month_wday);
+    if (ev !== null && ev - lead > after) return { event: ev, due: ev - lead };
+  }
+  return null;
+}
+const isMonthly = c => !!c.month_nth && !!c.month_wday;
 // Tage bis zur Fälligkeit einer Haushaltsaufgabe (0 = heute, negativ = überfällig)
-const choreDueIn = c => c.due_override ? dayNum(c.due_override) - dayNum(localNow().date) : (c.last_done ? c.interval_days - (dayNum(localNow().date) - dayNum(c.last_done)) : 0);
+const choreDueIn = c => {
+  const today = dayNum(localNow().date);
+  if (c.due_override) return dayNum(c.due_override) - today;
+  if (isMonthly(c)) { const n = monthlyNext(c); return n ? n.due - today : 0; }
+  return c.last_done ? c.interval_days - (today - dayNum(c.last_done)) : 0;
+};
+const WD_LONG = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag'];
+const choreRule = c => isMonthly(c)
+  ? `jeden ${c.month_nth === -1 ? 'letzten' : c.month_nth + '.'} ${WD_LONG[c.month_wday - 1]} im Monat` + (c.lead_days ? `, Erinnerung ${c.lead_days === 1 ? '1 Tag' : c.lead_days + ' Tage'} vorher` : '') + (c.remind_slot === 'evening' ? ' am Abend' : c.remind_slot === 'morning' ? ' am Morgen' : '')
+  : (c.interval_days === 1 ? 'jeden Tag' : `alle ${c.interval_days} Tage`);
+// Für Statistik: mittlerer Abstand und erlaubte Lücke
+const choreInterval = c => isMonthly(c) ? 30 : c.interval_days;
+const choreMaxGap = c => isMonthly(c) ? 35 : c.interval_days;
+// Zusatzfelder für Frontend und MCP
+function choreExtra(c) {
+  const today = dayNum(localNow().date), left = choreDueIn(c), n = isMonthly(c) ? monthlyNext(c) : null;
+  return { due_in: left, due_date: dateStr(today + left), event_date: !c.due_override && n ? dateStr(n.event) : null, rule: choreRule(c) };
+}
 const isDate = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(dayNum(s));
 const isTime = s => typeof s === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
 
@@ -192,7 +234,7 @@ function state(user) {
     teamGoal: +meta.get('team_goal', 120),
     vapidPublicKey: VAPID_PUBLIC,
     settings: q('SELECT morning, evening FROM user_settings WHERE user=?').get(user) || { morning: '09:00', evening: '18:00' },
-    chores: q('SELECT * FROM chores ORDER BY name').all(),
+    chores: q('SELECT * FROM chores ORDER BY name').all().map(c => ({ ...c, ...choreExtra(c) })),
     todos: q("SELECT * FROM todos WHERE done=0 OR done_at >= ? ORDER BY done, COALESCE(due, '9999'), id").all(new Date(Date.now() - 14 * 864e5).toISOString()),
     guests: q('SELECT * FROM guests ORDER BY name COLLATE NOCASE').all(),
     visits: q('SELECT * FROM visits ORDER BY date DESC, id DESC LIMIT 200').all().map(v => ({ ...v, guestIds: q('SELECT guest_id FROM visit_guests WHERE visit_id=?').all(v.id).map(r => r.guest_id) })),
@@ -214,13 +256,30 @@ function addLog(by, points, type, label, ref, date) {
 class OpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
 const fail = (status, msg) => { throw new OpError(status, msg); };
 const nowIso = () => new Date().toISOString();
+// Monatsregel aus Anfrage lesen. monthly_nth 0/null entfernt die Regel. Gibt null zurück, wenn nichts dazu angegeben ist.
+function parseMonthly(b, cur = {}) {
+  const keys = ['monthly_nth', 'monthly_weekday', 'lead_days', 'remind_slot'];
+  if (!keys.some(k => b[k] !== undefined)) return null;
+  const nthRaw = b.monthly_nth !== undefined ? b.monthly_nth : cur.month_nth;
+  if (nthRaw === null || nthRaw === '' || +nthRaw === 0) return { month_nth: null, month_wday: null, lead_days: 0, remind_slot: null };
+  const nth = +nthRaw === -1 ? -1 : int(nthRaw, 1, 5);
+  const wd = int(b.monthly_weekday !== undefined ? b.monthly_weekday : cur.month_wday, 1, 7);
+  const lead = int(b.lead_days !== undefined ? b.lead_days : (cur.lead_days ?? 0), 0, 14);
+  const slotRaw = b.remind_slot !== undefined ? b.remind_slot : cur.remind_slot;
+  const slot = slotRaw === 'morning' || slotRaw === 'evening' ? slotRaw : null;
+  if (slotRaw && !slot && slotRaw !== 'both') fail(400, 'remind_slot: morning, evening oder both');
+  if (!nth || !wd || lead === null) fail(400, 'Monatsregel: monthly_nth 1-5 oder -1 (letzter), monthly_weekday 1-7 (Mo-So), lead_days 0-14');
+  return { month_nth: nth, month_wday: wd, lead_days: lead, remind_slot: slot };
+}
 const ops = {
   choreAdd(user, b) {
-    const name = str(b.name, 80), iv = int(b.interval_days, 1, 365), pts = int(b.points ?? 10, 1, 100), as = str(b.assignee, 20);
-    if (!name || !iv || !pts || !isUser(as)) fail(400, 'Bitte Name, Intervall (1-365 Tage), Punkte (1-100) und Person angeben.');
+    const mo = parseMonthly(b), monthly = mo && mo.month_nth;
+    const name = str(b.name, 80), iv = monthly && b.interval_days === undefined ? 30 : int(b.interval_days, 1, 365), pts = int(b.points ?? 10, 1, 100), as = str(b.assignee, 20);
+    if (!name || !iv || !pts || !isUser(as)) fail(400, 'Bitte Name, Intervall (1-365 Tage) oder Monatsregel, Punkte (1-100) und Person angeben.');
     const due = b.next_due ? str(b.next_due, 10) : '';
     if (due && !isDate(due)) fail(400, 'Ungültiges Datum (YYYY-MM-DD)');
-    const r = q('INSERT INTO chores(name,interval_days,points,assignee,due_override,created_at) VALUES(?,?,?,?,?,?)').run(name, iv, pts, as, due || null, nowIso());
+    const m = mo || { month_nth: null, month_wday: null, lead_days: 0, remind_slot: null };
+    const r = q('INSERT INTO chores(name,interval_days,points,assignee,due_override,month_nth,month_wday,lead_days,remind_slot,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)').run(name, iv, pts, as, due || null, m.month_nth, m.month_wday, m.lead_days, m.remind_slot, nowIso());
     return { ok: true, id: Number(r.lastInsertRowid) };
   },
   choreGet(id) { const c = q('SELECT * FROM chores WHERE id=?').get(+id); if (!c) fail(404, 'Aufgabe nicht gefunden'); return c; },
@@ -233,7 +292,8 @@ const ops = {
     if (!name || !iv || !pts || !isUser(as)) fail(400, 'Ungültige Angaben');
     let due = c.due_override;
     if (b.next_due !== undefined) { const d = b.next_due === null ? '' : str(b.next_due, 10); if (d && !isDate(d)) fail(400, 'Ungültiges Datum (YYYY-MM-DD)'); due = d || null; }
-    q('UPDATE chores SET name=?, interval_days=?, points=?, assignee=?, due_override=? WHERE id=?').run(name, iv, pts, as, due, c.id);
+    const mo = parseMonthly(b, c) || c;
+    q('UPDATE chores SET name=?, interval_days=?, points=?, assignee=?, due_override=?, month_nth=?, month_wday=?, lead_days=?, remind_slot=? WHERE id=?').run(name, iv, pts, as, due, mo.month_nth ?? null, mo.month_wday ?? null, mo.lead_days ?? 0, mo.remind_slot ?? null, c.id);
     return { ok: true };
   },
   choreDelete(id) { const c = ops.choreGet(id); q('DELETE FROM chores WHERE id=?').run(c.id); return { ok: true }; },
@@ -393,14 +453,14 @@ function choreStats(month) {
     list.forEach((e, i) => {
       if (e.date < first || e.date > last) return;
       count++; if (perPerson[e.by] !== undefined) perPerson[e.by]++;
-      if (i > 0) { const gap = dayNum(e.date) - dayNum(list[i - 1].date); gaps.push(gap); if (gap <= c.interval_days) ok++; else { late++; maxLate = Math.max(maxLate, gap - c.interval_days); } }
+      if (i > 0) { const gap = dayNum(e.date) - dayNum(list[i - 1].date); gaps.push(gap); if (gap <= choreMaxGap(c)) ok++; else { late++; maxLate = Math.max(maxLate, gap - choreMaxGap(c)); } }
     });
     total += count; onTime += ok; rated += ok + late;
     for (const k in perPerson) people[k] += perPerson[k];
     const created = (c.created_at || first).slice(0, 10), firstLog = list[0]?.date;
     let since = created; if (firstLog && firstLog < since) since = firstLog; if (since < first) since = first;
     const daysInRange = Math.max(0, dayNum(monthRange(m).end) - dayNum(since) + 1);
-    return { id: c.id, name: c.name, assignee: c.assignee, interval_days: c.interval_days, count, expected: Math.max(0, Math.round(daysInRange / c.interval_days)), by_person: perPerson, avg_gap_days: gaps.length ? Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length * 10) / 10 : null, on_time: ok, late, max_days_late: maxLate };
+    return { id: c.id, name: c.name, assignee: c.assignee, interval_days: c.interval_days, count, rule: choreRule(c), expected: Math.max(0, Math.round(daysInRange / choreInterval(c))), by_person: perPerson, avg_gap_days: gaps.length ? Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length * 10) / 10 : null, on_time: ok, late, max_days_late: maxLate };
   });
   return { month: m, total, by_person: people, on_time_percent: rated ? Math.round(onTime / rated * 100) : null, chores };
 }
@@ -529,6 +589,7 @@ function longAbsentGuests() {
 
 function buildMessage(user, slot) {
   const d = dueFor(user);
+  d.chores = d.chores.filter(c => !c.remind_slot || c.remind_slot === slot || choreDueIn(c) < 0);
   const lines = [];
   const over = d.chores.filter(c => choreDueIn(c) < 0).sort((a, b) => choreDueIn(a) - choreDueIn(b)), dueToday = d.chores.filter(c => choreDueIn(c) === 0);
   if (over.length) lines.push('Überfällig: ' + over.slice(0, 4).map(c => `${c.name} (${-choreDueIn(c)} ${-choreDueIn(c) === 1 ? 'Tag' : 'Tage'})`).join(', ') + (over.length > 4 ? ' …' : ''));
@@ -633,7 +694,8 @@ const wdOf = d => WD[new Date(dayNum(d) * 864e5).getUTCDay()];
 function choreView(c) {
   const today = localNow().date;
   const left = choreDueIn(c);
-  return { id: c.id, name: c.name, assignee: c.assignee, interval_days: c.interval_days, points: c.points, last_done: c.last_by ? c.last_done : null, last_done_by: c.last_by || null, due_in_days: left, due_date: dateStr(dayNum(today) + Math.max(left, 0)), overdue: left < 0 };
+  const x = choreExtra(c);
+  return { id: c.id, name: c.name, assignee: c.assignee, rule: x.rule, interval_days: isMonthly(c) ? null : c.interval_days, monthly: isMonthly(c) ? { nth: c.month_nth, weekday: c.month_wday, lead_days: c.lead_days, remind_slot: c.remind_slot || 'both' } : null, event_date: x.event_date, points: c.points, last_done: c.last_by ? c.last_done : null, last_done_by: c.last_by || null, due_in_days: left, due_date: dateStr(dayNum(today) + Math.max(left, 0)), overdue: left < 0 };
 }
 function overview() {
   const today = localNow().date, ws = weekStart(today), goal = +meta.get('team_goal', 120);
@@ -656,9 +718,9 @@ function overview() {
 const P = (type, description, extra = {}) => ({ type, description, ...extra });
 const MCP_TOOLS = [
   { name: 'get_overview', description: 'Überblick: heutiges Datum, Personen, Teamziel der Woche, fällige Haushaltsaufgaben, offene To-dos, Essensplan dieser und nächster Woche, Gäste-Status, Gesundheits-Checkliste heute. Zuerst aufrufen, um den Kontext zu kennen.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => overview() },
-  { name: 'list_chores', description: 'Alle wiederkehrenden Haushaltsaufgaben mit Person, Intervall, Punkten und Fälligkeit.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => q('SELECT * FROM chores ORDER BY name').all().map(choreView) },
-  { name: 'add_chore', description: 'Neue wiederkehrende Haushaltsaufgabe anlegen, optional mit erstem Fälligkeitsdatum.', inputSchema: { type: 'object', properties: { name: P('string', 'Bezeichnung'), interval_days: P('integer', 'Alle wie viele Tage (1-365)'), points: P('integer', 'Punkte fürs Teamziel (1-100), Standard 10'), assignee: P('string', 'Schlüssel der zuständigen Person (siehe get_overview.people)'), next_due: P('string', 'Erste Fälligkeit YYYY-MM-DD (optional, sonst sofort fällig)') }, required: ['name', 'interval_days', 'assignee'] }, run: (u, a) => ops.choreAdd(u, a) },
-  { name: 'update_chore', description: 'Haushaltsaufgabe ändern (nur angegebene Felder), auch die nächste Fälligkeit verschieben.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), name: P('string', 'Neue Bezeichnung'), interval_days: P('integer', 'Neues Intervall in Tagen'), points: P('integer', 'Neue Punkte'), assignee: P('string', 'Neue zuständige Person'), next_due: P('string', 'Nächste Fälligkeit YYYY-MM-DD setzen (gilt bis zur nächsten Erledigung, danach wieder nach Intervall). Leerer String entfernt die manuelle Fälligkeit.') }, required: ['id'] }, run: (u, a) => ops.choreUpdate(a.id, a) },
+  { name: 'list_chores', description: 'Alle wiederkehrenden Haushaltsaufgaben mit Person, Rhythmus (Intervall oder Monatsregel), Punkten und Fälligkeit.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => q('SELECT * FROM chores ORDER BY name').all().map(choreView) },
+  { name: 'add_chore', description: 'Neue wiederkehrende Haushaltsaufgabe anlegen, optional mit erstem Fälligkeitsdatum.', inputSchema: { type: 'object', properties: { name: P('string', 'Bezeichnung'), interval_days: P('integer', 'Alle wie viele Tage (1-365); bei Monatsregel weglassen'), monthly_nth: P('integer', 'Monatsregel statt Intervall: n-ter Wochentag im Monat (1-5, -1 = letzter; 0 entfernt die Regel)'), monthly_weekday: P('integer', 'Wochentag der Monatsregel, 1=Mo bis 7=So'), lead_days: P('integer', 'Monatsregel: so viele Tage vor dem Termin fällig/erinnern (0-14)'), remind_slot: P('string', 'Monatsregel: Erinnerung nur im Push morning oder evening, both = beide'), points: P('integer', 'Punkte fürs Teamziel (1-100), Standard 10'), assignee: P('string', 'Schlüssel der zuständigen Person (siehe get_overview.people)'), next_due: P('string', 'Erste Fälligkeit YYYY-MM-DD (optional, sonst sofort fällig)') }, required: ['name', 'assignee'] }, run: (u, a) => ops.choreAdd(u, a) },
+  { name: 'update_chore', description: 'Haushaltsaufgabe ändern (nur angegebene Felder), auch die nächste Fälligkeit verschieben.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), name: P('string', 'Neue Bezeichnung'), interval_days: P('integer', 'Neues Intervall in Tagen'), monthly_nth: P('integer', 'Monatsregel statt Intervall: n-ter Wochentag im Monat (1-5, -1 = letzter; 0 entfernt die Regel)'), monthly_weekday: P('integer', 'Wochentag der Monatsregel, 1=Mo bis 7=So'), lead_days: P('integer', 'Monatsregel: so viele Tage vor dem Termin fällig/erinnern (0-14)'), remind_slot: P('string', 'Monatsregel: Erinnerung nur im Push morning oder evening, both = beide'), points: P('integer', 'Neue Punkte'), assignee: P('string', 'Neue zuständige Person'), next_due: P('string', 'Nächste Fälligkeit YYYY-MM-DD setzen (gilt bis zur nächsten Erledigung, danach wieder nach Intervall). Leerer String entfernt die manuelle Fälligkeit.') }, required: ['id'] }, run: (u, a) => ops.choreUpdate(a.id, a) },
   { name: 'delete_chore', description: 'Haushaltsaufgabe löschen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe') }, required: ['id'] }, destructive: true, run: (u, a) => ops.choreDelete(a.id) },
   { name: 'complete_chore', description: 'Haushaltsaufgabe als erledigt markieren (heute oder an einem früheren Tag nachtragen). Zählt fürs Teamziel.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Aufgabe'), person: { ...PERSON, description: 'Wer hat es erledigt. Ohne Angabe zählt es für die zuständige Person.' }, date: P('string', 'Erledigt am YYYY-MM-DD (optional, Standard heute, höchstens 60 Tage zurück)') }, required: ['id'] }, run: (u, a) => ops.choreDone(actor(u, a, ops.choreGet(a.id).assignee), a.id, a.date) },
   { name: 'list_todos', description: 'To-dos auflisten.', inputSchema: { type: 'object', properties: { include_done: P('boolean', 'Auch erledigte der letzten 30 Tage') } }, readOnly: true, run: (u, a) => q('SELECT id, title, due, assignee, done, done_by, done_at FROM todos WHERE done=0 OR (? AND done_at >= ?) ORDER BY done, COALESCE(due, \'9999\'), id').all(a.include_done ? 1 : 0, new Date(Date.now() - 30 * 864e5).toISOString()) },

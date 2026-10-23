@@ -54,8 +54,9 @@ function showLogin() {
 }
 
 function choreState(c) {
-  if (!c.last_done && !c.due_override) return { due: true, over: 0, text: 'noch nie erledigt', cls: 'warn' };
-  const left = c.due_override ? dayNum(c.due_override) - dayNum(S.today) : c.interval_days - daysSince(c.last_done);
+  const monthly = !!(c.month_nth && c.month_wday);
+  if (!monthly && !c.last_done && !c.due_override) return { due: true, over: 0, text: 'noch nie erledigt', cls: 'warn' };
+  const left = typeof c.due_in === 'number' ? c.due_in : (c.due_override ? dayNum(c.due_override) - dayNum(S.today) : c.interval_days - daysSince(c.last_done));
   if (left > 0) return { due: false, over: 0, text: left === 1 ? 'fällig morgen' : 'fällig in ' + left + ' Tagen', cls: 'ok' };
   if (left === 0) return { due: true, over: 0, text: 'heute fällig', cls: 'warn' };
   return { due: true, over: -left, text: 'seit ' + (-left) + (left === -1 ? ' Tag' : ' Tagen') + ' überfällig', cls: 'bad' };
@@ -153,7 +154,7 @@ function render() {
   if (!order.length) cl.appendChild(li('<p class="empty">Noch keine Aufgaben.</p>'));
   for (const { c, s } of order) {
     if (editing === c.id) { cl.appendChild(editRow(c)); continue; }
-    const l = li('<div class="who"><b>' + esc(c.name) + '</b><div><span class="pill ' + s.cls + '">' + s.text + '</span> · ' + esc(NAME(c.assignee)) + ' · alle ' + c.interval_days + ' Tage' + (c.last_done && c.last_by ? ' · zuletzt ' + fmt(c.last_done) : '') + '</div></div><span class="pts">+' + c.points + '</span>');
+    const l = li('<div class="who"><b>' + esc(c.name) + '</b><div><span class="pill ' + s.cls + '">' + s.text + '</span> · ' + esc(NAME(c.assignee)) + ' · ' + esc(c.rule || ('alle ' + c.interval_days + ' Tage')) + (c.event_date ? ' · nächster Termin ' + fmt(c.event_date) : '') + (c.last_done && c.last_by ? ' · zuletzt ' + fmt(c.last_done) : '') + '</div></div><span class="pts">+' + c.points + '</span>');
     if (c.last_done !== S.today) l.appendChild(btn('Erledigt', 'done', () => act('POST', 'chores/' + c.id + '/done', null, d => '+' + d.points + ' Punkte fürs Team')));
     l.appendChild(btn('Ändern', 'link', () => { editing = c.id; pending = null; render(); }));
     cl.appendChild(l);
@@ -324,7 +325,7 @@ function renderChoreHist() {
   for (const c of st.chores.slice().sort((a, b) => (b.count / (b.expected || 1)) - (a.count / (a.expected || 1)) || a.name.localeCompare(b.name))) {
     const ratio = c.expected ? c.count / c.expected : 1;
     const cls = ratio >= 1 ? 'ok-t' : ratio >= .5 ? 'warn-t' : 'bad-t';
-    t += '<tr><td class="name">' + esc(c.name) + '</td><td>' + esc(NAME(c.assignee)) + '</td><td class="n ' + cls + '">' + c.count + ' / ' + c.expected + '</td><td class="n">' + (c.avg_gap_days === null ? '–' : c.avg_gap_days + ' T') + ' <small class="hint">(' + c.interval_days + ')</small></td><td class="n">' + (c.late ? '<span class="bad-t">' + c.late + '×, max ' + c.max_days_late + ' T</span>' : (c.on_time ? '<span class="ok-t">nie</span>' : '–')) + '</td></tr>';
+    t += '<tr><td class="name">' + esc(c.name) + '</td><td>' + esc(NAME(c.assignee)) + '</td><td class="n ' + cls + '">' + c.count + ' / ' + c.expected + '</td><td class="n">' + (c.avg_gap_days === null ? '–' : c.avg_gap_days + ' T') + ' <small class="hint">(' + (c.rule && c.rule.includes('im Monat') ? 'monatl.' : c.interval_days) + ')</small></td><td class="n">' + (c.late ? '<span class="bad-t">' + c.late + '×, max ' + c.max_days_late + ' T</span>' : (c.on_time ? '<span class="ok-t">nie</span>' : '–')) + '</td></tr>';
   }
   $('choreStats').innerHTML = t + '</tbody>';
   const hl = $('choreHistory'); hl.innerHTML = '';
@@ -336,22 +337,46 @@ function renderChoreHist() {
   }
 }
 
+// Felder für den Rhythmus: alle n Tage oder n-ter Wochentag im Monat
+const WD_FULL = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag'];
+function rhythmHtml() {
+  return '<div class="row"><label>Rhythmus<select name="mode"><option value="days">Alle … Tage</option><option value="month">Monatlich (Wochentag)</option></select></label></div>' +
+    '<div class="row" data-m="days"><label>Alle … Tage<input type="number" name="iv" min="1" max="365" value="7"></label></div>' +
+    '<div class="row" data-m="month" hidden><label>Welcher<select name="nth"><option value="1">1.</option><option value="2">2.</option><option value="3">3.</option><option value="4">4.</option><option value="-1">letzter</option></select></label>' +
+    '<label>Wochentag<select name="wd">' + WD_FULL.map((w, i) => '<option value="' + (i + 1) + '">' + w + '</option>').join('') + '</select></label>' +
+    '<label>Tage vorher<input type="number" name="lead" min="0" max="14" value="0"></label>' +
+    '<label>Erinnerung<select name="slot"><option value="both">Morgen und Abend</option><option value="morning">Morgen</option><option value="evening">Abend</option></select></label></div>';
+}
+function rhythmWire(f, c) {
+  const sync = () => f.querySelectorAll('[data-m]').forEach(r => { r.hidden = r.dataset.m !== f.mode.value; r.querySelectorAll('input').forEach(i => { i.required = !r.hidden; }); });
+  if (c) {
+    if (c.month_nth && c.month_wday) { f.mode.value = 'month'; f.nth.value = c.month_nth; f.wd.value = c.month_wday; f.lead.value = c.lead_days || 0; f.slot.value = c.remind_slot || 'both'; }
+    else f.iv.value = c.interval_days;
+  }
+  f.mode.addEventListener('change', sync); sync();
+}
+function rhythmBody(f) {
+  if (f.mode.value === 'month') return { monthly_nth: +f.nth.value, monthly_weekday: +f.wd.value, lead_days: +f.lead.value || 0, remind_slot: f.slot.value };
+  return { interval_days: +f.iv.value, monthly_nth: 0 };
+}
+
 function editRow(c) {
   const l = document.createElement('li');
   const f = document.createElement('form'); f.className = 'edit';
-  f.innerHTML = '<label>Aufgabe<input type="text" name="name" maxlength="80" required></label><div class="row"><label>Alle … Tage<input type="number" name="iv" min="1" max="365" required></label><label>Punkte<input type="number" name="pts" min="1" max="100" required></label><label>Wer<select name="who"></select></label></div><div class="row"></div>';
-  f.name.value = c.name; f.iv.value = c.interval_days; f.pts.value = c.points;
+  f.innerHTML = '<label>Aufgabe<input type="text" name="name" maxlength="80" required></label>' + rhythmHtml() + '<div class="row"><label>Punkte<input type="number" name="pts" min="1" max="100" required></label><label>Wer<select name="who"></select></label></div><div class="row"></div>';
+  f.name.value = c.name; f.pts.value = c.points; rhythmWire(f, c);
   for (const u of S.users) f.who.add(new Option(u.name, u.key)); f.who.value = c.assignee;
   const bar = f.querySelectorAll('.row')[1];
   const save = document.createElement('button'); save.type = 'submit'; save.className = 'primary'; save.textContent = 'Speichern'; bar.appendChild(save);
   bar.appendChild(btn('Abbrechen', 'link', () => { editing = null; render(); }));
   bar.appendChild(confirmBtn('c' + c.id, 'Aufgabe löschen', 'Wirklich löschen?', async () => { editing = null; await act('DELETE', 'chores/' + c.id, null, 'Aufgabe gelöscht'); }));
-  f.addEventListener('submit', async e => { e.preventDefault(); editing = null; await act('PATCH', 'chores/' + c.id, { name: f.name.value, interval_days: +f.iv.value, points: +f.pts.value, assignee: f.who.value }, 'Gespeichert'); });
+  f.addEventListener('submit', async e => { e.preventDefault(); editing = null; await act('PATCH', 'chores/' + c.id, { name: f.name.value, ...rhythmBody(f), points: +f.pts.value, assignee: f.who.value }, 'Gespeichert'); });
   l.appendChild(f); return l;
 }
 
 // Formulare
-$('choreForm').addEventListener('submit', async e => { e.preventDefault(); const d = await act('POST', 'chores', { name: $('cName').value, interval_days: +$('cInt').value, points: +$('cPts').value, assignee: $('cWho').value }, 'Aufgabe hinzugefügt'); if (d) $('cName').value = ''; });
+$('cRhythm').innerHTML = rhythmHtml(); rhythmWire($('choreForm'));
+$('choreForm').addEventListener('submit', async e => { e.preventDefault(); const body = rhythmBody($('choreForm')); if (body.monthly_nth === 0) delete body.monthly_nth; const d = await act('POST', 'chores', { name: $('cName').value, ...body, points: +$('cPts').value, assignee: $('cWho').value }, 'Aufgabe hinzugefügt'); if (d) $('cName').value = ''; });
 $('todoForm').addEventListener('submit', async e => { e.preventDefault(); const d = await act('POST', 'todos', { title: $('tTitle').value, due: $('tDue').value, assignee: $('tWho').value }, 'To-do hinzugefügt'); if (d) { $('tTitle').value = ''; $('tDue').value = ''; } });
 $('personForm').addEventListener('submit', async e => { e.preventDefault(); const n = $('pName').value; const d = await act('POST', 'guests', { name: n }, n.trim() + ' hinzugefügt'); if (d) $('pName').value = ''; });
 $('visitForm').addEventListener('submit', async e => {
