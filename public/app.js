@@ -75,6 +75,9 @@ function choreState(c) {
 }
 const pastVisits = () => S.visits.filter(v => v.date <= S.today);
 const plannedVisits = () => S.visits.filter(v => v.date > S.today).sort((a, b) => a.date < b.date ? -1 : 1);
+// Anzeige: Besuche von heute bleiben bei den anstehenden, erst ab morgen im Verlauf
+const upcomingVisits = () => S.visits.filter(v => v.date >= S.today).sort((a, b) => a.date < b.date ? -1 : 1);
+const earlierVisits = () => S.visits.filter(v => v.date < S.today);
 const lastVisitOf = gid => { for (const v of pastVisits()) if (v.guestIds.includes(gid)) return v.date; return null; };
 const nextVisitOf = gid => plannedVisits().find(v => v.guestIds.includes(gid))?.date || null;
 function fillSelect(sel, withBoth) {
@@ -204,16 +207,16 @@ function render() {
     sg.appendChild(l);
   }
   const pl = $('planned'); pl.innerHTML = '';
-  $('plannedBox').hidden = !plannedVisits().length;
-  for (const v of plannedVisits()) {
-    const l = li('<div class="who"><b>' + esc(v.guestIds.map(id => S.guests.find(g => g.id === id)?.name || 'Entfernte Person').join(', ') || 'Ohne Namen') + '</b><div>' + fmt(v.date) + ', ' + (dayNum(v.date) - dayNum(S.today) === 1 ? 'morgen' : 'in ' + (dayNum(v.date) - dayNum(S.today)) + ' Tagen') + (v.note ? ' · ' + esc(v.note) : '') + '</div></div>');
-    l.appendChild(confirmBtn('v' + v.id, 'Absagen', 'Wirklich absagen?', () => act('DELETE', 'visits/' + v.id, null, 'Besuch abgesagt')));
+  $('plannedBox').hidden = !upcomingVisits().length;
+  for (const v of upcomingVisits()) {
+    const l = li('<div class="who"><b>' + esc(v.guestIds.map(id => S.guests.find(g => g.id === id)?.name || 'Entfernte Person').join(', ') || 'Ohne Namen') + '</b><div>' + fmt(v.date) + ', ' + (v.date === S.today ? '<span class="pill ok">heute</span>' : dayNum(v.date) - dayNum(S.today) === 1 ? 'morgen' : 'in ' + (dayNum(v.date) - dayNum(S.today)) + ' Tagen') + (v.note ? ' · ' + esc(v.note) : '') + '</div></div>');
+    l.appendChild(v.date === S.today ? confirmBtn('v' + v.id, 'Löschen', 'Wirklich löschen?', () => act('DELETE', 'visits/' + v.id, null, 'Besuch gelöscht')) : confirmBtn('v' + v.id, 'Absagen', 'Wirklich absagen?', () => act('DELETE', 'visits/' + v.id, null, 'Besuch abgesagt')));
     pl.appendChild(l);
   }
   const h = $('history'); h.innerHTML = '';
-  if (!pastVisits().length) h.appendChild(li('<p class="empty">Noch keine Besuche.</p>'));
+  if (!earlierVisits().length) h.appendChild(li('<p class="empty">Noch keine früheren Besuche.</p>'));
   const gname = id => S.guests.find(g => g.id === id)?.name || 'Entfernte Person';
-  for (const v of pastVisits().slice(0, 30)) {
+  for (const v of earlierVisits().slice(0, 30)) {
     const l = li('<div class="who"><b>' + esc(v.guestIds.map(gname).join(', ') || 'Ohne Namen') + '</b><div>' + fmt(v.date) + (v.note ? ' · ' + esc(v.note) : '') + '</div></div>');
     l.appendChild(confirmBtn('v' + v.id, 'Löschen', 'Wirklich löschen?', () => act('DELETE', 'visits/' + v.id, null, 'Besuch gelöscht')));
     h.appendChild(l);
