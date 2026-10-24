@@ -265,13 +265,51 @@ function renderMeals() {
 
 // ---------- Gesundheit ----------
 // ---------- Einkauf ----------
+const norm = s => s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+function renderShopSugg() {
+  const box = $('shopSugg'); if (!box || !S) return;
+  const qv = $('shName').value.trim(), nq = norm(qv);
+  const open = new Set(S.shopping.filter(i => !i.done).map(i => norm(i.name)));
+  let list = S.shoppingSuggestions.filter(x => !open.has(norm(x.name)));
+  if (nq) {
+    list = list.filter(x => norm(x.name).includes(nq) && norm(x.name) !== nq)
+      .sort((a, b) => (norm(b.name).startsWith(nq) - norm(a.name).startsWith(nq)) || b.n - a.n);
+  }
+  list = list.slice(0, nq ? 8 : 12);
+  box.innerHTML = '';
+  if (!list.length) return;
+  const lead = document.createElement('span'); lead.className = 'lead'; lead.textContent = nq ? 'Vorschläge' : 'Häufig gekauft'; box.appendChild(lead);
+  for (const x of list) {
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'sg';
+    let label = esc(x.name);
+    if (nq) { const i = norm(x.name).indexOf(nq); if (i >= 0) label = esc(x.name.slice(0, i)) + '<mark>' + esc(x.name.slice(i, i + qv.length)) + '</mark>' + esc(x.name.slice(i + qv.length)); }
+    const qty = $('shQty').value.trim();
+    b.innerHTML = '+ ' + label + (qty ? '<small>' + esc(qty) + '</small>' : '');
+    b.addEventListener('click', async () => {
+      const d = await act('POST', 'shopping', { name: x.name, qty }, r => r.merged ? x.name + ' war schon auf der Liste' : x.name + ' hinzugefügt');
+      if (d) { $('shName').value = ''; $('shQty').value = ''; renderShopSugg(); }
+    });
+    box.appendChild(b);
+  }
+}
+function renderShopMem() {
+  const box = $('shopMem'); if (!box) return;
+  $('shopMemBox').hidden = !S.shoppingSuggestions.length;
+  box.innerHTML = '';
+  for (const x of S.shoppingSuggestions.slice().sort((a, b) => a.name.localeCompare(b.name))) {
+    const s = document.createElement('span'); s.className = 'memchip'; s.textContent = x.name;
+    const del = btn('×', 'link', () => act('POST', 'shopping/forget', { name: x.name }, x.name + ' wird nicht mehr vorgeschlagen'));
+    del.setAttribute('aria-label', x.name + ' nicht mehr vorschlagen'); s.appendChild(del); box.appendChild(s);
+  }
+}
 let shopKey = '';
 function renderShop() {
   const open = S.shopping.filter(i => !i.done), done = S.shopping.filter(i => i.done);
   $('badgeShop').hidden = !open.length; $('badgeShop').textContent = open.length;
   const key = JSON.stringify(S.shopping) + '|' + pending;
   if (key === shopKey) return; shopKey = key;
-  const dl = $('shopIdeas'); dl.innerHTML = ''; for (const n of S.shoppingSuggestions) dl.appendChild(new Option(n));
+  renderShopSugg();
+  renderShopMem();
   $('shOpenTitle').textContent = open.length ? 'Zu kaufen (' + open.length + ')' : 'Zu kaufen';
   const row = (it) => {
     const l = document.createElement('li'); l.className = 'shoprow';
@@ -456,6 +494,8 @@ $('shopForm').addEventListener('submit', async e => {
   const d = await act('POST', 'shopping', { name, qty: $('shQty').value }, r => r.merged ? name + ' war schon auf der Liste' : name + ' hinzugefügt');
   if (d) { $('shName').value = ''; $('shQty').value = ''; $('shName').focus(); }
 });
+$('shName').addEventListener('input', renderShopSugg);
+$('shQty').addEventListener('input', renderShopSugg);
 $('shClear').addEventListener('click', () => act('POST', 'shopping/clear', null, r => r.removed + ' entfernt'));
 
 // Gesundheit & Verlauf

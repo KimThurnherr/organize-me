@@ -246,7 +246,7 @@ function state(user) {
     meals: q('SELECT date, title, note FROM meals WHERE date >= ? AND date <= ? ORDER BY date').all(dateStr(weekStart(localNow().date) - 7), dateStr(weekStart(localNow().date) + 13)),
     healthToday: healthDay(user),
     shopping: shoppingList(),
-    shoppingSuggestions: q('SELECT name FROM shopping_names ORDER BY n DESC, last DESC LIMIT 150').all().map(r => r.name),
+    shoppingSuggestions: q('SELECT name, n FROM shopping_names ORDER BY n DESC, last DESC LIMIT 300').all(),
     longAbsent: longAbsentGuests(),
     guestRemindDays: GUEST_REMIND_DAYS,
     mealIdeas: q('SELECT title, COUNT(*) AS n FROM meals GROUP BY lower(title) ORDER BY n DESC, max(date) DESC LIMIT 60').all().map(r => r.title),
@@ -426,6 +426,7 @@ const ops = {
     return { ok: true };
   },
   shopDelete(id) { const i = ops.shopGet(id); q('DELETE FROM shopping WHERE id=?').run(i.id); return { ok: true }; },
+  shopForget(name) { const r = q('DELETE FROM shopping_names WHERE name=?').run(str(name, 80)); if (!r.changes) fail(404, 'Vorschlag nicht gefunden'); return { ok: true }; },
   shopClearDone() { const r = q('DELETE FROM shopping WHERE done=1').run(); return { ok: true, removed: Number(r.changes) }; },
   settingsSet(user, b) {
     const cur = q('SELECT morning, evening FROM user_settings WHERE user=?').get(user) || { morning: '09:00', evening: '18:00' };
@@ -544,6 +545,7 @@ async function api(req, res, user, route) {
     if (m === 'POST' && route === 'settings') return send(res, 200, ops.settingsSet(user, body));
     if (m === 'POST' && route === 'shopping') return send(res, 200, ops.shopAdd(user, body));
     if (m === 'POST' && route === 'shopping/clear') return send(res, 200, ops.shopClearDone());
+    if (m === 'POST' && route === 'shopping/forget') return send(res, 200, ops.shopForget(body.name));
     if ((mm = route.match(/^shopping\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.shopUpdate(mm[1], body));
     if ((mm = route.match(/^shopping\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.shopDelete(mm[1]));
     if ((mm = route.match(/^shopping\/(\d+)\/done$/)) && m === 'POST') return send(res, 200, ops.shopSetDone(user, mm[1], !!body.done));
@@ -840,6 +842,8 @@ const MCP_TOOLS = [
     } },
   { name: 'update_shopping_item', description: 'Name oder Menge eines Artikels ändern.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID'), name: P('string', 'Neuer Name'), qty: P('string', 'Neue Menge, leerer String entfernt sie') }, required: ['id'] }, run: (u, a) => ops.shopUpdate(a.id, a) },
   { name: 'remove_shopping_items', description: 'Artikel von der Liste löschen.', inputSchema: { type: 'object', properties: { ids: { type: 'array', items: { type: 'integer' }, description: 'IDs aus get_shopping_list' } }, required: ['ids'] }, destructive: true, run: (u, a) => ({ ok: true, results: (a.ids || []).slice(0, 100).map(id => ({ id, ...ops.shopDelete(id) })) }) },
+  { name: 'get_shopping_suggestions', description: 'Gedächtnis der Einkaufsliste: früher erfasste Artikel mit Häufigkeit.', inputSchema: { type: 'object', properties: { query: P('string', 'Filter (optional)') } }, readOnly: true, run: (u, a) => q('SELECT name, n AS times, last FROM shopping_names WHERE name LIKE ? ORDER BY n DESC, last DESC LIMIT 100').all('%' + str(a.query, 80) + '%') },
+  { name: 'forget_shopping_suggestion', description: 'Einen Artikel aus dem Gedächtnis der Einkaufsliste entfernen (z.B. Tippfehler), damit er nicht mehr vorgeschlagen wird.', inputSchema: { type: 'object', properties: { name: P('string', 'Exakter Name') }, required: ['name'] }, destructive: true, run: (u, a) => ops.shopForget(a.name) },
   { name: 'clear_bought_items', description: 'Alle als gekauft markierten Artikel von der Liste entfernen.', inputSchema: { type: 'object', properties: {} }, destructive: true, run: () => ops.shopClearDone() },
 ];
 const MCP_INSTRUCTIONS = 'Flechte ist die Haushalts-App eines Paares: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (Ziel: jede Woche jemand zu Gast) und ein gemeinsames Wochen-Teamziel in Punkten. Dazu gibt es eine gemeinsame Einkaufsliste, eine tägliche Gesundheits-Checkliste pro Person mit Monatsstatistik sowie einen Verlauf und eine Monatsstatistik der Haushaltsaufgaben. Rufe zuerst get_overview auf. Daten sind auf Deutsch, Datumsformat YYYY-MM-DD, Zeitzone ' + TZ + '. Das Konto kann von beiden Personen gemeinsam genutzt werden: Gib bei Aktionen, die einer Person zugerechnet werden, den Parameter person an und frage nach, wenn nicht klar ist, wer gerade schreibt. Haushaltsaufgaben haben eine feste zuständige Person (assignee).';
@@ -857,7 +861,7 @@ async function handleMcp(req, res) {
     const isNote = msg.id === undefined;
     const ok = result => isNote ? null : { jsonrpc: '2.0', id: msg.id, result };
     switch (msg.method) {
-      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.3.0' }, instructions: MCP_INSTRUCTIONS });
+      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.4.0' }, instructions: MCP_INSTRUCTIONS });
       case 'ping': return ok({});
       case 'tools/list': return ok({ tools: MCP_TOOLS.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, annotations: { readOnlyHint: !!t.readOnly, destructiveHint: !!t.destructive, openWorldHint: false } })) });
       case 'tools/call': {

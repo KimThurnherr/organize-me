@@ -153,11 +153,12 @@
       <div><h2>Einkaufsliste</h2><p class="hint">Gemeinsame Liste. Antippen hakt ab, gekaufte Artikel bleiben 7 Tage sichtbar.</p></div>
       <form class="card" id="shopForm">
         <div class="row">
-          <label class="grow" for="shName">Artikel<input type="text" id="shName" list="shopIdeas" maxlength="80" required autocomplete="off" placeholder="z.B. Milch"></label>
+          <label class="grow" for="shName">Artikel<input type="text" id="shName" maxlength="80" required autocomplete="off" autocapitalize="sentences" placeholder="z.B. Milch"></label>
           <label for="shQty" style="flex:0 1 110px">Menge<input type="text" id="shQty" maxlength="30" autocomplete="off" placeholder="2 l"></label>
           <button class="primary" type="submit">Hinzufügen</button>
         </div>
-        <datalist id="shopIdeas"></datalist>
+        <div class="sugg" id="shopSugg" aria-label="Vorschläge"></div>
+        <details id="shopMemBox"><summary>Vorschläge verwalten</summary><p class="hint">Einträge, die nicht mehr vorgeschlagen werden sollen, hier entfernen.</p><div class="chips" id="shopMem"></div></details>
       </form>
       <div class="card">
         <div class="goal-head"><h2 id="shOpenTitle">Zu kaufen</h2></div>
