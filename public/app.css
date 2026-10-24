@@ -142,3 +142,5 @@ dialog.confirm .row { display: flex; justify-content: flex-end; gap: 8px; margin
 .sg mark { background: none; color: inherit; text-decoration: underline; text-underline-offset: 2px; }
 .memchip { display: inline-flex; align-items: center; gap: 2px; background: var(--bg); border: 1px solid var(--line); border-radius: 999px; padding: 2px 4px 2px 12px; font-size: .9rem; }
 .memchip button { padding: 4px 8px; color: var(--muted); }
+
+.sym { font-family: system-ui, -apple-system, "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans Symbols", "Apple Symbols", "DejaVu Sans", sans-serif; font-weight: 400; font-style: normal; line-height: 1; vertical-align: baseline; font-variant-emoji: text; }

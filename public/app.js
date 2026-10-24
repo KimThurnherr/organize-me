@@ -9,7 +9,9 @@ const dstrN = n => new Date(n * 864e5).toISOString().slice(0, 10);
 const monthLabel = m => MONTHS[+m.slice(5) - 1] + ' ' + m.slice(0, 4);
 const shiftMonth = (m, d) => { let y = +m.slice(0, 4), mo = +m.slice(5) + d; while (mo < 1) { mo += 12; y--; } while (mo > 12) { mo -= 12; y++; } return y + '-' + String(mo).padStart(2, '0'); };
 const NAME = k => S?.users.find(u => u.key === k)?.name || k || '';
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+// Symbole wie ♀ ♂ ☆ → fehlen in der Webschrift; eigene Schrift und Textdarstellung, damit sie nicht verrutschen
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
+  .replace(/([\u2190-\u2BFF])\uFE0F?/g, '<span class="sym">$1\uFE0E</span>');
 const dayNum = s => { const [y, m, d] = s.split('-').map(Number); return Date.UTC(y, m - 1, d) / 864e5; };
 const daysSince = s => dayNum(S.today) - dayNum(s);
 const weekStart = s => { const n = dayNum(s); return n - ((new Date(n * 864e5).getUTCDay() + 6) % 7); };
