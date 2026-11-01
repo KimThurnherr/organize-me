@@ -39,6 +39,7 @@
       <button class="tab" role="tab" data-tab="shop">Einkauf<span class="badge soft" id="badgeShop" hidden></span></button>
       <button class="tab" role="tab" data-tab="todos">To-dos</button>
       <button class="tab" role="tab" data-tab="guests">Gäste</button>
+      <button class="tab" role="tab" data-tab="plants">Pflanzen<span class="badge soft" id="badgePlants" hidden></span></button>
       <button class="tab" role="tab" data-tab="settings">Einstellungen</button>
     </nav>
 
@@ -74,6 +75,10 @@
         <div class="big small-big" id="guestBig">–</div>
         <span class="pill" id="guestPill"></span>
         <div id="absentBox" hidden><p class="hint" id="absentHint"></p><ul class="list" id="absentList"></ul></div>
+      </div>
+      <div class="card" id="plantHomeCard" hidden>
+        <div class="goal-head"><h2>Pflanzen</h2><button class="link" type="button" id="toPlants">Alle Pflanzen</button></div>
+        <ul class="list" id="plantHome"></ul>
       </div>
       <div class="card">
         <h2 id="otherTitle">Beim anderen fällig</h2>
@@ -205,6 +210,21 @@
       </form>
       <h2>Verlauf</h2>
       <div class="card"><ul class="list" id="history"></ul></div>
+    </section>
+
+    <!-- Pflanzen -->
+    <section data-panel="plants" class="panel" hidden>
+      <div><h2>Pflanzen</h2><p class="hint">Pflanze und Standort eingeben, die App erstellt einen Jahres-Pflegeplan und erinnert euch beide im Morgen-Push. Ein fälliger Pflegeschritt gibt 5 Punkte.</p></div>
+      <div class="notice" id="plantAiHint" hidden>Pflegepläne sind noch nicht eingerichtet: Auf dem Server fehlt der Anthropic-API-Key.</div>
+      <form class="card" id="plantForm">
+        <label for="plName">Pflanze<input type="text" id="plName" maxlength="80" required autocomplete="off" placeholder="z.B. Rosmarin"></label>
+        <div class="row">
+          <label class="grow" for="plLoc">Standort (optional)<input type="text" id="plLoc" maxlength="80" autocomplete="off" placeholder="z.B. Topf an der Hauswand"></label>
+          <label class="grow" for="plNotes">Notiz (optional)<input type="text" id="plNotes" maxlength="300" autocomplete="off" placeholder="z.B. Sorte, dieses Jahr gekauft"></label>
+        </div>
+        <div><button class="primary" type="submit" id="plSubmit">Hinzufügen und Pflegeplan erstellen</button></div>
+      </form>
+      <div id="plantList"></div>
     </section>
 
     <!-- Einstellungen -->

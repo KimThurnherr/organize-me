@@ -2,6 +2,7 @@
 const $ = id => document.getElementById(id);
 let S = null, tab = 'home', pending = null, editing = null, selected = new Set(), busy = false;
 let weekOffset = null, mealsDirty = false, mealsKey = '';
+let plEditing = null, ptEditing = null;
 let H = null, hDate = null, hMonth = null, hPerson = null, hEditing = null, CH = null, cMonth = null;
 const MONTHS = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
 const WDS = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
@@ -131,6 +132,7 @@ function render() {
   const hOpen = S.healthToday.items.filter(i => !i.done).length;
   $('badgeHealth').hidden = !hOpen; $('badgeHealth').textContent = hOpen;
   renderShop();
+  renderPlants();
   if (tab === 'health') renderHealth();
   if (tab === 'chores') renderChoreHist();
 
@@ -437,6 +439,106 @@ function renderChoreHist() {
   }
 }
 
+// ---------- Pflanzen ----------
+const mdTxt = md => md ? +md.slice(3) + '.' + +md.slice(0, 2) + '.' : '';
+const shortDate = d => d ? fmt(d).slice(0, 6) : '';
+function plantStatus(t) {
+  if (t.due) return '<span class="pill ' + (t.days_left <= 3 ? 'bad' : 'warn') + '">' + (t.days_left === 0 ? 'jetzt fällig, heute letzter Tag' : 'jetzt fällig, bis ' + shortDate(t.window_end)) + '</span>';
+  if (t.next_due) return '<span class="pill ok">nächstes Mal ' + shortDate(t.next_due) + '</span>';
+  if (t.active && t.last_done) return '<span class="pill ok">erledigt ' + shortDate(t.last_done) + '</span>' + (t.next_start ? ' · wieder ab ' + shortDate(t.next_start) : '');
+  return 'ab ' + shortDate(t.next_start);
+}
+const plantDoneBtn = (label, t) => doneBtn(label, () => act('POST', 'plant-tasks/' + t.id + '/done', null, d => d.points ? '+' + d.points + ' Punkte fürs Team' : 'Erledigt'));
+async function slowAct(method, url, body, msg, btnEl) {
+  if (busy) return;
+  toast('Pflegeplan wird erstellt, das dauert einen Moment …');
+  if (btnEl) btnEl.disabled = true;
+  try { return await act(method, url, body, msg); } finally { if (btnEl) btnEl.disabled = false; }
+}
+function taskFields(t) {
+  return '<label>Pflegeschritt<input type="text" name="title" maxlength="80" required></label>' +
+    '<label>Details (optional)<input type="text" name="details" maxlength="500"></label>' +
+    '<div class="row"><label>Von (TT.MM.)<input type="text" name="start" maxlength="6" inputmode="decimal" required placeholder="1.3."></label>' +
+    '<label>Bis (TT.MM.)<input type="text" name="end" maxlength="6" inputmode="decimal" required placeholder="30.4."></label>' +
+    '<label>Alle … Tage (leer = einmal)<input type="number" name="iv" min="1" max="120"></label></div>';
+}
+function taskForm(t, onSubmit, extra) {
+  const f = document.createElement('form'); f.className = 'edit';
+  f.innerHTML = taskFields() + '<div class="row"></div>';
+  if (t) { f.title.value = t.title; f.details.value = t.details || ''; f.start.value = mdTxt(t.start_md); f.end.value = mdTxt(t.end_md); f.iv.value = t.interval_days || ''; }
+  const bar = f.querySelectorAll('.row')[1];
+  const sv = document.createElement('button'); sv.type = 'submit'; sv.className = t ? 'primary' : 'ghost'; sv.textContent = t ? 'Speichern' : 'Hinzufügen'; bar.appendChild(sv);
+  if (extra) extra(bar);
+  f.addEventListener('submit', e => { e.preventDefault(); onSubmit({ title: f.title.value, details: f.details.value, start: f.start.value, end: f.end.value, interval_days: f.iv.value ? +f.iv.value : null }, f); });
+  return f;
+}
+function renderPlants() {
+  const due = [];
+  for (const p of S.plants) for (const t of p.tasks) if (t.due) due.push({ p, t });
+  due.sort((a, b) => a.t.days_left - b.t.days_left);
+  $('badgePlants').hidden = !due.length; $('badgePlants').textContent = due.length;
+  const ph = $('plantHome'); ph.innerHTML = '';
+  $('plantHomeCard').hidden = !due.length;
+  for (const { p, t } of due) {
+    const l = li('<div class="who"><b>' + esc(p.name) + ': ' + esc(t.title) + '</b><div>' + plantStatus(t) + (t.details ? ' · ' + esc(t.details) : '') + '</div></div>');
+    l.appendChild(plantDoneBtn(p.name + ': ' + t.title, t)); ph.appendChild(l);
+  }
+  if (tab !== 'plants') return;
+  $('plantAiHint').hidden = S.plantsAi; $('plSubmit').disabled = !S.plantsAi;
+  const box = $('plantList'); box.innerHTML = '';
+  if (!S.plants.length) { const c = document.createElement('div'); c.className = 'card'; c.innerHTML = '<p class="empty">Noch keine Pflanzen erfasst.</p>'; box.appendChild(c); }
+  for (const p of S.plants) {
+    const card = document.createElement('div'); card.className = 'card';
+    if (plEditing === p.id) {
+      const f = document.createElement('form'); f.className = 'edit';
+      f.innerHTML = '<label>Pflanze<input type="text" name="n" maxlength="80" required></label><div class="row"><label class="grow">Standort<input type="text" name="loc" maxlength="80"></label><label class="grow">Notiz<input type="text" name="notes" maxlength="300"></label></div><p class="hint">Nach einem Standortwechsel den Pflegeplan neu erstellen.</p><div class="row"></div>';
+      f.n.value = p.name; f.loc.value = p.location || ''; f.notes.value = p.notes || '';
+      const bar = f.querySelectorAll('.row')[1];
+      const sv = document.createElement('button'); sv.type = 'submit'; sv.className = 'primary'; sv.textContent = 'Speichern'; bar.appendChild(sv);
+      bar.appendChild(btn('Abbrechen', 'link', () => { plEditing = null; render(); }));
+      f.addEventListener('submit', async e => { e.preventDefault(); plEditing = null; await act('PATCH', 'plants/' + p.id, { name: f.n.value, location: f.loc.value, notes: f.notes.value }, 'Gespeichert'); });
+      card.appendChild(f);
+    } else {
+      const head = document.createElement('div');
+      head.innerHTML = '<div class="goal-head"><h2>' + esc(p.name) + '</h2>' + (p.location ? '<span class="pill">' + esc(p.location) + '</span>' : '') + '</div>' +
+        (p.botanical ? '<p class="hint"><i>' + esc(p.botanical) + '</i></p>' : '') + (p.summary ? '<p class="hint">' + esc(p.summary) + '</p>' : '') + (p.notes ? '<p class="hint">Notiz: ' + esc(p.notes) + '</p>' : '');
+      card.appendChild(head);
+    }
+    const ul = document.createElement('ul'); ul.className = 'list';
+    if (!p.tasks.length) ul.appendChild(li('<p class="empty">Kein Pflegeplan. Neu erstellen oder Schritte von Hand hinzufügen.</p>'));
+    for (const t of p.tasks) {
+      if (ptEditing === t.id) {
+        const l = document.createElement('li');
+        l.appendChild(taskForm(t, async b => { ptEditing = null; await act('PATCH', 'plant-tasks/' + t.id, b, 'Gespeichert'); }, bar => {
+          bar.appendChild(btn('Abbrechen', 'link', () => { ptEditing = null; render(); }));
+          bar.appendChild(confirmBtn('pt' + t.id, 'Schritt löschen', 'Wirklich löschen?', async () => { ptEditing = null; await act('DELETE', 'plant-tasks/' + t.id, null, 'Gelöscht'); }));
+        }));
+        ul.appendChild(l); continue;
+      }
+      const l = li('<div class="who"><b>' + esc(t.title) + '</b><div>' + plantStatus(t) + ' · ' + esc(t.rule) + (t.details ? '<br>' + esc(t.details) : '') + '</div></div>');
+      if (t.due) l.appendChild(plantDoneBtn(p.name + ': ' + t.title, t));
+      l.appendChild(btn('Ändern', 'link', () => { ptEditing = t.id; plEditing = null; pending = null; render(); }));
+      ul.appendChild(l);
+    }
+    card.appendChild(ul);
+    const add = document.createElement('details');
+    add.innerHTML = '<summary>Pflegeschritt hinzufügen</summary>';
+    add.appendChild(taskForm(null, async (b, f) => { const d = await act('POST', 'plants/' + p.id + '/tasks', b, 'Pflegeschritt hinzugefügt'); if (d) f.reset(); }));
+    card.appendChild(add);
+    if (plEditing !== p.id) {
+      const bar = document.createElement('div'); bar.className = 'row';
+      bar.appendChild(btn('Ändern', 'link', () => { plEditing = p.id; ptEditing = null; pending = null; render(); }));
+      if (S.plantsAi) {
+        if (pending === 'pr' + p.id) { const b = btn('Plan ersetzen?', 'link danger', () => { pending = null; slowAct('POST', 'plants/' + p.id + '/regenerate', null, d => 'Neuer Pflegeplan mit ' + d.tasks + ' Schritten', b); }); bar.appendChild(b); }
+        else bar.appendChild(btn('Pflegeplan neu erstellen', 'link', () => { pending = 'pr' + p.id; render(); }));
+      }
+      bar.appendChild(confirmBtn('pl' + p.id, 'Pflanze löschen', 'Samt Plan löschen?', () => act('DELETE', 'plants/' + p.id, null, p.name + ' gelöscht')));
+      card.appendChild(bar);
+    }
+    box.appendChild(card);
+  }
+}
+
 // Felder für den Rhythmus: alle n Tage oder n-ter Wochentag im Monat
 const WD_FULL = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag'];
 function rhythmHtml() {
@@ -487,7 +589,7 @@ $('visitForm').addEventListener('submit', async e => {
 });
 $('settingsForm').addEventListener('submit', async e => { e.preventDefault(); await act('POST', 'settings', { morning: $('sMorning').value, evening: $('sEvening').value, teamGoal: +$('sGoal').value }, 'Gespeichert'); });
 $('logout').addEventListener('click', async () => { await fetch('/auth/logout', { method: 'POST' }); location.href = '/'; });
-for (const b of document.querySelectorAll('.tab')) b.addEventListener('click', () => { tab = b.dataset.tab; pending = null; editing = null; hEditing = null; render(); if (tab === 'health') loadHealth(); if (tab === 'chores') loadChoreHist(); });
+for (const b of document.querySelectorAll('.tab')) b.addEventListener('click', () => { tab = b.dataset.tab; pending = null; editing = null; hEditing = null; plEditing = null; ptEditing = null; render(); if (tab === 'health') loadHealth(); if (tab === 'chores') loadChoreHist(); });
 
 // Einkauf
 $('shopForm').addEventListener('submit', async e => {
@@ -499,6 +601,15 @@ $('shopForm').addEventListener('submit', async e => {
 $('shName').addEventListener('input', renderShopSugg);
 $('shQty').addEventListener('input', renderShopSugg);
 $('shClear').addEventListener('click', () => act('POST', 'shopping/clear', null, r => r.removed + ' entfernt'));
+
+// Pflanzen
+$('toPlants').addEventListener('click', () => { tab = 'plants'; render(); });
+$('plantForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const name = $('plName').value.trim(); if (!name) return;
+  const d = await slowAct('POST', 'plants', { name, location: $('plLoc').value, notes: $('plNotes').value }, r => name + ': Pflegeplan mit ' + r.tasks + ' Schritten erstellt', $('plSubmit'));
+  if (d) { $('plName').value = ''; $('plLoc').value = ''; $('plNotes').value = ''; }
+});
 
 // Gesundheit & Verlauf
 $('toHealth').addEventListener('click', () => { tab = 'health'; render(); loadHealth(); });

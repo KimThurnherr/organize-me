@@ -19,6 +19,12 @@ const GOOGLE_CLIENT_SECRET = env.GOOGLE_CLIENT_SECRET || '';
 const GUEST_REMIND_DAYS = +(env.GUEST_REMIND_DAYS || 60); // so lange nicht mehr da -> Erinnerung
 const GUEST_REMIND_REPEAT = +(env.GUEST_REMIND_REPEAT || 14); // danach alle n Tage wiederholen
 const DEV_LOGIN = env.DEV_LOGIN === '1'; // nur lokal zum Testen
+// Pflegepläne für Pflanzen per Claude (Schlüssel bleibt auf dem Server, nie im Frontend)
+const ANTHROPIC_API_KEY = env.ANTHROPIC_API_KEY || '';
+const ANTHROPIC_MODEL = env.ANTHROPIC_MODEL || 'claude-haiku-5-5';
+const PLANT_REGION = env.PLANT_REGION || 'Mitteleuropa';
+const PLANT_AI_PER_HOUR = +(env.PLANT_AI_PER_HOUR || 30);
+const ANTHROPIC_BASE_URL = (env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/$/, '');
 const SECURE_COOKIE = PUBLIC_URL.startsWith('https://');
 // ALLOWED_USERS="alex:alex@example.com,sam:sam@example.com" (Reihenfolge zählt für die Standard-Aufgaben)
 const USERS = Object.fromEntries((env.ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean).map(s => {
@@ -55,6 +61,12 @@ try { db.exec('ALTER TABLE chores ADD COLUMN due_override TEXT'); } catch { /* S
 for (const col of ['month_nth INTEGER', 'month_wday INTEGER', 'lead_days INTEGER NOT NULL DEFAULT 0', 'remind_slot TEXT']) {
   try { db.exec('ALTER TABLE chores ADD COLUMN ' + col); } catch { /* Spalte existiert schon */ }
 }
+// Pflanzen mit Jahres-Pflegeplan: Aufgaben mit Zeitfenster (MM-TT bis MM-TT, auch über den Jahreswechsel)
+// und optionalem Intervall innerhalb des Fensters (z.B. giessen alle 7 Tage), sonst einmal pro Fenster
+db.exec(`
+CREATE TABLE IF NOT EXISTS plants (id INTEGER PRIMARY KEY, name TEXT NOT NULL, location TEXT, notes TEXT, botanical TEXT, summary TEXT, created_by TEXT, created_at TEXT, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS plant_tasks (id INTEGER PRIMARY KEY, plant_id INTEGER NOT NULL REFERENCES plants(id) ON DELETE CASCADE, title TEXT NOT NULL, details TEXT, start_md TEXT NOT NULL, end_md TEXT NOT NULL, interval_days INTEGER, last_done TEXT, last_by TEXT, created_at TEXT);
+`);
 const meta = {
   get: (k, d) => { const r = q('SELECT v FROM meta WHERE k=?').get(k); return r ? r.v : d; },
   set: (k, v) => q('INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v').run(k, String(v)),
@@ -250,6 +262,8 @@ function state(user) {
     longAbsent: longAbsentGuests(),
     guestRemindDays: GUEST_REMIND_DAYS,
     mealIdeas: q('SELECT title, COUNT(*) AS n FROM meals GROUP BY lower(title) ORDER BY n DESC, max(date) DESC LIMIT 60').all().map(r => r.title),
+    plants: plantsView(),
+    plantsAi: !!ANTHROPIC_API_KEY,
   };
 }
 
@@ -438,6 +452,177 @@ const ops = {
   },
 };
 
+// ---------- Pflanzen ----------
+const DIM = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const isMd = s => typeof s === 'string' && /^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.test(s) && +s.slice(3) <= DIM[+s.slice(0, 2) - 1];
+// TT.MM. oder MM-TT annehmen, MM-TT zurückgeben
+const toMd = v => { const s = str(v, 10); const m = s.match(/^(\d{1,2})\.(\d{1,2})\.?$/); const md = m ? m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0') : s; return isMd(md) ? md : null; };
+// Tag (dayNum) eines MM-TT im Jahr y, 29.2. in Nicht-Schaltjahren = 28.2.
+const mdOn = (y, md) => { const [m, d] = md.split('-').map(Number); return Date.UTC(y, m - 1, Math.min(d, new Date(Date.UTC(y, m, 0)).getUTCDate())) / 864e5; };
+// Aktuelles Zeitfenster einer Aufgabe oder, wenn gerade keines läuft, der nächste Beginn
+function plantWindow(t) {
+  const today = dayNum(localNow().date), y = +localNow().date.slice(0, 4);
+  for (const yy of [y - 1, y]) {
+    const s = mdOn(yy, t.start_md); let e = mdOn(yy, t.end_md); if (e < s) e = mdOn(yy + 1, t.end_md);
+    if (today >= s && today <= e) return { active: true, start: s, end: e };
+  }
+  let ns = mdOn(y, t.start_md); if (ns <= today) ns = mdOn(y + 1, t.start_md);
+  return { active: false, start: ns, end: null };
+}
+function plantTaskStatus(t) {
+  const today = dayNum(localNow().date), w = plantWindow(t), last = t.last_done ? dayNum(t.last_done) : null;
+  if (!w.active) return { due: false, active: false, next_start: dateStr(w.start) };
+  const doneInWindow = last !== null && last >= w.start;
+  const due = t.interval_days ? (!doneInWindow || today - last >= t.interval_days) : !doneInWindow;
+  const st = { due, active: true, window_start: dateStr(w.start), window_end: dateStr(w.end), days_left: w.end - today };
+  if (!due && t.interval_days) { const nx = last + t.interval_days; if (nx <= w.end) st.next_due = dateStr(nx); }
+  if (!due && !st.next_due) { let ns = mdOn(+dateStr(w.start).slice(0, 4) + 1, t.start_md); st.next_start = dateStr(ns); }
+  return st;
+}
+// Push: Intervall-Aufgaben am Fälligkeitstag, einmalige zu Beginn des Fensters, dann wöchentlich und am letzten Tag
+function plantRemindToday(t, st) {
+  if (!st.due) return false;
+  if (t.interval_days) return true;
+  const since = dayNum(localNow().date) - dayNum(st.window_start);
+  return since % 7 === 0 || st.days_left === 0;
+}
+const fmtMd = md => md ? +md.slice(3) + '.' + +md.slice(0, 2) + '.' : '';
+const plantRule = t => (t.start_md === '01-01' && t.end_md === '12-31' ? 'ganzjährig' : fmtMd(t.start_md) + '–' + fmtMd(t.end_md)) + (t.interval_days ? (t.interval_days === 1 ? ', täglich' : ', alle ' + t.interval_days + ' Tage') : ', einmal');
+function plantsView() {
+  return q('SELECT * FROM plants ORDER BY name COLLATE NOCASE').all().map(p => ({
+    ...p,
+    tasks: q('SELECT * FROM plant_tasks WHERE plant_id=?').all(p.id).map(t => ({ ...t, rule: plantRule(t), ...plantTaskStatus(t) }))
+      .sort((a, b) => (b.due - a.due) || (b.active - a.active) || ((a.window_start || a.next_start || '') < (b.window_start || b.next_start || '') ? -1 : 1)),
+  }));
+}
+function duePlantTasks() {
+  const out = [];
+  for (const p of plantsView()) for (const t of p.tasks) if (t.due) out.push({ ...t, plant: p.name, location: p.location });
+  return out.sort((a, b) => a.days_left - b.days_left);
+}
+
+// Pflegeplan bereinigen und prüfen (Daten aus KI oder MCP)
+function cleanPlan(raw) {
+  const tasks = (Array.isArray(raw?.tasks) ? raw.tasks : []).slice(0, 20).map(t => ({
+    title: str(t?.title, 80), details: str(t?.details, 500), start_md: toMd(t?.start), end_md: toMd(t?.end),
+    interval_days: t?.interval_days === null || t?.interval_days === undefined || t?.interval_days === '' ? null : int(t.interval_days, 1, 120),
+  })).filter(t => t.title && t.start_md && t.end_md);
+  return { summary: str(raw?.summary, 800), botanical: str(raw?.botanical_name, 80), tasks };
+}
+const PLAN_TOOL = {
+  name: 'pflegeplan',
+  description: 'Jahres-Pflegeplan einer Pflanze speichern.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      botanical_name: { type: 'string', description: 'Botanischer Name der angenommenen Art' },
+      summary: { type: 'string', description: 'Kurz: Winterhärte, Standort, Besonderheiten, getroffene Annahmen (max. 4 Sätze)' },
+      tasks: {
+        type: 'array', minItems: 1, maxItems: 15,
+        items: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: 'Kurze Handlung, z.B. "Zurückschneiden" oder "An die Hauswand stellen"' },
+            details: { type: 'string', description: 'Wie genau, 1-2 Sätze' },
+            start: { type: 'string', description: 'Beginn des Zeitfensters MM-TT' },
+            end: { type: 'string', description: 'Ende des Zeitfensters MM-TT (darf über den Jahreswechsel gehen)' },
+            interval_days: { type: ['integer', 'null'], description: 'Nur für Wiederkehrendes im Fenster (Giessen, Düngen), sonst null = einmal pro Fenster' },
+          },
+          required: ['title', 'details', 'start', 'end', 'interval_days'],
+        },
+      },
+    },
+    required: ['botanical_name', 'summary', 'tasks'],
+  },
+};
+let aiCalls = [];
+async function aiPlantPlan(p) {
+  if (!ANTHROPIC_API_KEY) fail(503, 'Pflegepläne sind nicht eingerichtet: ANTHROPIC_API_KEY fehlt auf dem Server.');
+  aiCalls = aiCalls.filter(t => Date.now() - t < 36e5);
+  if (aiCalls.length >= PLANT_AI_PER_HOUR) fail(429, 'Zu viele Pflegepläne in der letzten Stunde. Bitte später nochmals.');
+  aiCalls.push(Date.now());
+  const system = `Du bist erfahrene Gärtnerin für Haus- und Hobbygarten in der Region ${PLANT_REGION}. Erstelle für die genannte Pflanze einen praxistauglichen Jahres-Pflegeplan mit den wichtigen Arbeiten: Rückschnitt, Winterschutz bzw. Einräumen und Ausräumen, Düngen, Giessen, Umtopfen, Ernte, Vermehrung, wo sinnvoll. Berücksichtige den Standort (z.B. Topf, Beet, drinnen). Regeln: 3 bis 10 Aufgaben, nur was für diese Pflanze wirklich nötig ist. Zeitfenster realistisch für die Region (MM-TT). interval_days nur für regelmässige Arbeiten im Fenster (Giessen im Topf, Düngen), nicht kürzer als 2 Tage, sonst null. Giessen nur aufnehmen, wenn es eine feste Regel braucht (Topfpflanzen im Sommer, Überwinterung drinnen). Wenn die Pflanze mehrdeutig ist, nimm die gängigste Gartenart an und nenne die Annahme in summary. Schreibe Deutsch in Schweizer Rechtschreibung (ss statt ß), knapp und konkret, ohne Emojis.`;
+  const user = `Pflanze: ${p.name}\nStandort: ${p.location || 'nicht angegeben'}\nNotiz: ${p.notes || '-'}\nHeutiges Datum: ${localNow().date}`;
+  let r;
+  try {
+    r = await fetch(ANTHROPIC_BASE_URL + '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 3000, system, tools: [PLAN_TOOL], tool_choice: { type: 'tool', name: 'pflegeplan' }, messages: [{ role: 'user', content: user }] }),
+      signal: AbortSignal.timeout(90000),
+    });
+  } catch (e) { console.error('Anthropic nicht erreichbar', e.message); fail(502, 'Pflegeplan-Dienst nicht erreichbar. Bitte später nochmals.'); }
+  if (!r.ok) { console.error('Anthropic', r.status, (await r.text()).slice(0, 300)); fail(502, 'Pflegeplan konnte nicht erstellt werden (Fehler ' + r.status + ').'); }
+  const d = await r.json();
+  const tu = (d.content || []).find(c => c.type === 'tool_use');
+  const plan = cleanPlan(tu?.input);
+  if (!plan.tasks.length) fail(502, 'Pflegeplan war leer. Bitte nochmals versuchen.');
+  return plan;
+}
+function savePlan(plantId, plan) {
+  db.exec('BEGIN');
+  try {
+    q('DELETE FROM plant_tasks WHERE plant_id=?').run(plantId);
+    const ins = q('INSERT INTO plant_tasks(plant_id,title,details,start_md,end_md,interval_days,created_at) VALUES(?,?,?,?,?,?,?)');
+    for (const t of plan.tasks) ins.run(plantId, t.title, t.details || null, t.start_md, t.end_md, t.interval_days, nowIso());
+    q('UPDATE plants SET botanical=?, summary=?, updated_at=? WHERE id=?').run(plan.botanical || null, plan.summary || null, nowIso(), plantId);
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+function readTask(b, cur = {}) {
+  const title = b.title !== undefined ? str(b.title, 80) : cur.title;
+  const details = b.details !== undefined ? str(b.details, 500) : (cur.details || '');
+  const start = b.start !== undefined ? toMd(b.start) : cur.start_md, end = b.end !== undefined ? toMd(b.end) : cur.end_md;
+  const ivEmpty = b.interval_days === null || b.interval_days === '' || +b.interval_days === 0;
+  const iv = b.interval_days !== undefined ? (ivEmpty ? null : int(b.interval_days, 1, 120)) : (cur.interval_days ?? null);
+  if (!title) fail(400, 'Bitte eine Bezeichnung angeben.');
+  if (!start || !end) fail(400, 'Zeitfenster als TT.MM. angeben, z.B. 1.3. bis 30.4.');
+  if (b.interval_days !== undefined && !ivEmpty && iv === null) fail(400, 'Intervall 1-120 Tage oder leer lassen');
+  return { title, details, start_md: start, end_md: end, interval_days: iv };
+}
+Object.assign(ops, {
+  plantGet(id) { const p = q('SELECT * FROM plants WHERE id=?').get(+id); if (!p) fail(404, 'Pflanze nicht gefunden'); return p; },
+  plantTaskGet(id) { const t = q('SELECT * FROM plant_tasks WHERE id=?').get(+id); if (!t) fail(404, 'Pflegeschritt nicht gefunden'); return t; },
+  async plantAdd(user, b) {
+    const name = str(b.name, 80), location = str(b.location, 80), notes = str(b.notes, 300);
+    if (!name) fail(400, 'Bitte die Pflanze angeben.');
+    const plan = Array.isArray(b.tasks) ? cleanPlan({ tasks: b.tasks, summary: b.summary, botanical_name: b.botanical_name }) : await aiPlantPlan({ name, location, notes });
+    if (Array.isArray(b.tasks) && !plan.tasks.length) fail(400, 'Keine gültigen Pflegeschritte (title, start, end als MM-TT oder TT.MM.)');
+    const r = q('INSERT INTO plants(name,location,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?)').run(name, location || null, notes || null, user, nowIso(), nowIso());
+    const id = Number(r.lastInsertRowid);
+    savePlan(id, plan);
+    return { ok: true, id, tasks: plan.tasks.length };
+  },
+  plantUpdate(id, b) {
+    const p = ops.plantGet(id);
+    const name = b.name !== undefined ? str(b.name, 80) : p.name, location = b.location !== undefined ? str(b.location, 80) : (p.location || ''), notes = b.notes !== undefined ? str(b.notes, 300) : (p.notes || '');
+    if (!name) fail(400, 'Name darf nicht leer sein');
+    q('UPDATE plants SET name=?, location=?, notes=?, updated_at=? WHERE id=?').run(name, location || null, notes || null, nowIso(), p.id);
+    return { ok: true };
+  },
+  async plantRegenerate(id) { const p = ops.plantGet(id); const plan = await aiPlantPlan(p); savePlan(p.id, plan); return { ok: true, tasks: plan.tasks.length }; },
+  plantDelete(id) { const p = ops.plantGet(id); q('DELETE FROM plant_tasks WHERE plant_id=?').run(p.id); q('DELETE FROM plants WHERE id=?').run(p.id); q("DELETE FROM log WHERE type='plant' AND ref LIKE ?").run(p.id + ':%'); return { ok: true }; },
+  plantTaskAdd(plantId, b) {
+    const p = ops.plantGet(plantId), t = readTask(b);
+    const r = q('INSERT INTO plant_tasks(plant_id,title,details,start_md,end_md,interval_days,created_at) VALUES(?,?,?,?,?,?,?)').run(p.id, t.title, t.details || null, t.start_md, t.end_md, t.interval_days, nowIso());
+    return { ok: true, id: Number(r.lastInsertRowid) };
+  },
+  plantTaskUpdate(id, b) {
+    const c = ops.plantTaskGet(id), t = readTask(b, c);
+    q('UPDATE plant_tasks SET title=?, details=?, start_md=?, end_md=?, interval_days=? WHERE id=?').run(t.title, t.details || null, t.start_md, t.end_md, t.interval_days, c.id);
+    return { ok: true };
+  },
+  plantTaskDelete(id) { const t = ops.plantTaskGet(id); q('DELETE FROM plant_tasks WHERE id=?').run(t.id); return { ok: true }; },
+  plantTaskDone(user, id) {
+    const t = ops.plantTaskGet(id), today = localNow().date, p = ops.plantGet(t.plant_id);
+    if (t.last_done === today) fail(409, 'Heute schon erledigt');
+    const st = plantTaskStatus(t), points = st.due ? 5 : 0;
+    q('UPDATE plant_tasks SET last_done=?, last_by=? WHERE id=?').run(today, user, t.id);
+    if (points) addLog(user, points, 'plant', p.name + ': ' + t.title, p.id + ':' + t.id, today);
+    return { ok: true, points };
+  },
+});
+
 // ---------- Gesundheit & Statistik ----------
 const nameOf = u => USER_NAMES[u] || (u ? u.charAt(0).toUpperCase() + u.slice(1) : '');
 const monthOf = m => /^\d{4}-(0[1-9]|1[0-2])$/.test(m || '') ? m : localNow().date.slice(0, 7);
@@ -549,6 +734,14 @@ async function api(req, res, user, route) {
     if ((mm = route.match(/^shopping\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.shopUpdate(mm[1], body));
     if ((mm = route.match(/^shopping\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.shopDelete(mm[1]));
     if ((mm = route.match(/^shopping\/(\d+)\/done$/)) && m === 'POST') return send(res, 200, ops.shopSetDone(user, mm[1], !!body.done));
+    if (m === 'POST' && route === 'plants') return send(res, 200, await ops.plantAdd(user, { name: body.name, location: body.location, notes: body.notes }));
+    if ((mm = route.match(/^plants\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.plantUpdate(mm[1], body));
+    if ((mm = route.match(/^plants\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.plantDelete(mm[1]));
+    if ((mm = route.match(/^plants\/(\d+)\/regenerate$/)) && m === 'POST') return send(res, 200, await ops.plantRegenerate(mm[1]));
+    if ((mm = route.match(/^plants\/(\d+)\/tasks$/)) && m === 'POST') return send(res, 200, ops.plantTaskAdd(mm[1], body));
+    if ((mm = route.match(/^plant-tasks\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.plantTaskUpdate(mm[1], body));
+    if ((mm = route.match(/^plant-tasks\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.plantTaskDelete(mm[1]));
+    if ((mm = route.match(/^plant-tasks\/(\d+)\/done$/)) && m === 'POST') return send(res, 200, ops.plantTaskDone(user, mm[1]));
   } catch (e) {
     if (e instanceof OpError) return send(res, e.status, { error: e.message });
     throw e;
@@ -656,6 +849,9 @@ function buildMessage(user, slot) {
   if (slot === 'morning') {
     const vt = q('SELECT DISTINCT g.name FROM visits v JOIN visit_guests vg ON vg.visit_id=v.id JOIN guests g ON g.id=vg.guest_id WHERE v.date=? ORDER BY g.name').all(today).map(r => r.name);
     if (vt.length) lines.push('Heute zu Gast: ' + vt.join(', '));
+    // Pflanzen an beide Personen, nur im Morgen-Push
+    const pt = duePlantTasks().filter(t => plantRemindToday(t, t));
+    if (pt.length) lines.push('Pflanzen: ' + pt.slice(0, 4).map(t => `${t.plant}: ${t.title}`).join(', ') + (pt.length > 4 ? ' …' : ''));
   }
   if (slot === 'evening') {
     const due = longAbsentGuests().filter(g => { const r = q('SELECT date FROM guest_reminders WHERE guest_id=? AND user=?').get(g.id, user); return !r || dnum - dayNum(r.date) >= GUEST_REMIND_REPEAT; });
@@ -776,9 +972,14 @@ function overview() {
     health_today: Object.keys(USERS).map(k => healthDay(k, today)),
     shopping_open: q('SELECT id, name, qty FROM shopping WHERE done=0 ORDER BY id').all(),
     guests: { last_visit: lastVisit, planned_visits: planned, days_since: lastVisit ? dayNum(today) - dayNum(lastVisit) : null, goal: 'jede Woche jemand zu Gast', long_absent: longAbsentGuests(), long_absent_threshold_days: GUEST_REMIND_DAYS },
+    due_plant_tasks: duePlantTasks().map(plantTaskMcp),
   };
 }
 const P = (type, description, extra = {}) => ({ type, description, ...extra });
+function plantTaskMcp(t) {
+  return { id: t.id, ...(t.plant ? { plant: t.plant, location: t.location || null } : {}), title: t.title, details: t.details || null, rule: t.rule, start: t.start_md, end: t.end_md, interval_days: t.interval_days, due: t.due, window_end: t.window_end || null, next_due: t.next_due || null, next_start: t.next_start || null, last_done: t.last_done || null, last_done_by: t.last_by || null };
+}
+const TASK_PROPS = { title: P('string', 'Kurze Handlung, z.B. Zurückschneiden'), details: P('string', 'Wie genau (optional)'), start: P('string', 'Beginn des Zeitfensters MM-TT'), end: P('string', 'Ende des Zeitfensters MM-TT (darf über den Jahreswechsel gehen)'), interval_days: P('integer', 'Wiederholen alle n Tage innerhalb des Fensters (1-120); weglassen/0 = einmal pro Fenster') };
 const MCP_TOOLS = [
   { name: 'get_overview', description: 'Überblick: heutiges Datum, Personen, Teamziel der Woche, fällige Haushaltsaufgaben, offene To-dos, Essensplan dieser und nächster Woche, Gäste-Status, Gesundheits-Checkliste heute, offene Einkaufsliste. Zuerst aufrufen, um den Kontext zu kennen.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => overview() },
   { name: 'list_chores', description: 'Alle wiederkehrenden Haushaltsaufgaben mit Person, Rhythmus (Intervall oder Monatsregel), Punkten und Fälligkeit.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => q('SELECT * FROM chores ORDER BY name').all().map(choreView) },
@@ -845,8 +1046,17 @@ const MCP_TOOLS = [
   { name: 'get_shopping_suggestions', description: 'Gedächtnis der Einkaufsliste: früher erfasste Artikel mit Häufigkeit.', inputSchema: { type: 'object', properties: { query: P('string', 'Filter (optional)') } }, readOnly: true, run: (u, a) => q('SELECT name, n AS times, last FROM shopping_names WHERE name LIKE ? ORDER BY n DESC, last DESC LIMIT 100').all('%' + str(a.query, 80) + '%') },
   { name: 'forget_shopping_suggestion', description: 'Einen Artikel aus dem Gedächtnis der Einkaufsliste entfernen (z.B. Tippfehler), damit er nicht mehr vorgeschlagen wird.', inputSchema: { type: 'object', properties: { name: P('string', 'Exakter Name') }, required: ['name'] }, destructive: true, run: (u, a) => ops.shopForget(a.name) },
   { name: 'clear_bought_items', description: 'Alle als gekauft markierten Artikel von der Liste entfernen.', inputSchema: { type: 'object', properties: {} }, destructive: true, run: () => ops.shopClearDone() },
+  { name: 'list_plants', description: 'Pflanzen mit Standort, Pflegehinweis und Jahres-Pflegeplan (Zeitfenster, Intervall, ob jetzt fällig).', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => plantsView().map(p => ({ id: p.id, name: p.name, location: p.location, notes: p.notes, botanical: p.botanical, summary: p.summary, tasks: p.tasks.map(plantTaskMcp) })) },
+  { name: 'add_plant', description: 'Pflanze erfassen. Ohne tasks erstellt die App den Pflegeplan selbst per KI (dauert einige Sekunden); mit tasks wird der mitgegebene Plan gespeichert.', inputSchema: { type: 'object', properties: { name: P('string', 'Pflanze, z.B. Rosmarin'), location: P('string', 'Standort, z.B. Topf an der Hauswand (optional)'), notes: P('string', 'Notiz, z.B. Sorte (optional)'), summary: P('string', 'Kurzer Pflegehinweis, nur zusammen mit tasks'), tasks: { type: 'array', maxItems: 20, items: { type: 'object', properties: TASK_PROPS, required: ['title', 'start', 'end'] } }, person: PERSON }, required: ['name'] }, run: (u, a) => ops.plantAdd(actor(u, a, Object.keys(USERS)[0]), a) },
+  { name: 'update_plant', description: 'Name, Standort oder Notiz einer Pflanze ändern.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Pflanze'), name: P('string', 'Neuer Name'), location: P('string', 'Neuer Standort, leer entfernt'), notes: P('string', 'Neue Notiz, leer entfernt') }, required: ['id'] }, run: (u, a) => ops.plantUpdate(a.id, a) },
+  { name: 'regenerate_plant_plan', description: 'Pflegeplan einer Pflanze per KI neu erstellen (ersetzt alle Pflegeschritte), z.B. nach Standortwechsel.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Pflanze') }, required: ['id'] }, destructive: true, run: (u, a) => ops.plantRegenerate(a.id) },
+  { name: 'delete_plant', description: 'Pflanze samt Pflegeplan löschen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Pflanze') }, required: ['id'] }, destructive: true, run: (u, a) => ops.plantDelete(a.id) },
+  { name: 'add_plant_task', description: 'Pflegeschritt zu einer Pflanze hinzufügen.', inputSchema: { type: 'object', properties: { plant_id: P('integer', 'ID der Pflanze'), ...TASK_PROPS }, required: ['plant_id', 'title', 'start', 'end'] }, run: (u, a) => ops.plantTaskAdd(a.plant_id, a) },
+  { name: 'update_plant_task', description: 'Pflegeschritt ändern (nur angegebene Felder).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID des Pflegeschritts'), ...TASK_PROPS }, required: ['id'] }, run: (u, a) => ops.plantTaskUpdate(a.id, a) },
+  { name: 'delete_plant_task', description: 'Pflegeschritt löschen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID des Pflegeschritts') }, required: ['id'] }, destructive: true, run: (u, a) => ops.plantTaskDelete(a.id) },
+  { name: 'complete_plant_task', description: 'Pflegeschritt heute als erledigt markieren. Fällige Schritte geben 5 Punkte fürs Teamziel.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID des Pflegeschritts'), person: PERSON }, required: ['id'] }, run: (u, a) => ops.plantTaskDone(actor(u, a), a.id) },
 ];
-const MCP_INSTRUCTIONS = 'Flechte ist die Haushalts-App eines Paares: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (Ziel: jede Woche jemand zu Gast) und ein gemeinsames Wochen-Teamziel in Punkten. Dazu gibt es eine gemeinsame Einkaufsliste, eine tägliche Gesundheits-Checkliste pro Person mit Monatsstatistik sowie einen Verlauf und eine Monatsstatistik der Haushaltsaufgaben. Rufe zuerst get_overview auf. Daten sind auf Deutsch, Datumsformat YYYY-MM-DD, Zeitzone ' + TZ + '. Das Konto kann von beiden Personen gemeinsam genutzt werden: Gib bei Aktionen, die einer Person zugerechnet werden, den Parameter person an und frage nach, wenn nicht klar ist, wer gerade schreibt. Haushaltsaufgaben haben eine feste zuständige Person (assignee).';
+const MCP_INSTRUCTIONS = 'Flechte ist die Haushalts-App eines Paares: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (Ziel: jede Woche jemand zu Gast) und ein gemeinsames Wochen-Teamziel in Punkten. Dazu gibt es eine gemeinsame Einkaufsliste, eine tägliche Gesundheits-Checkliste pro Person mit Monatsstatistik sowie einen Verlauf und eine Monatsstatistik der Haushaltsaufgaben und Pflanzen mit Jahres-Pflegeplan (Pflegeschritte mit Zeitfenster MM-TT, Erinnerung an beide). Rufe zuerst get_overview auf. Daten sind auf Deutsch, Datumsformat YYYY-MM-DD, Zeitzone ' + TZ + '. Das Konto kann von beiden Personen gemeinsam genutzt werden: Gib bei Aktionen, die einer Person zugerechnet werden, den Parameter person an und frage nach, wenn nicht klar ist, wer gerade schreibt. Haushaltsaufgaben haben eine feste zuständige Person (assignee).';
 const mcpRate = new Map();
 async function handleMcp(req, res) {
   if (req.method === 'GET' || req.method === 'DELETE') return send(res, 405, { error: 'Nur POST' }, undefined, { Allow: 'POST' });
@@ -861,7 +1071,7 @@ async function handleMcp(req, res) {
     const isNote = msg.id === undefined;
     const ok = result => isNote ? null : { jsonrpc: '2.0', id: msg.id, result };
     switch (msg.method) {
-      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.4.0' }, instructions: MCP_INSTRUCTIONS });
+      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.5.0' }, instructions: MCP_INSTRUCTIONS });
       case 'ping': return ok({});
       case 'tools/list': return ok({ tools: MCP_TOOLS.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, annotations: { readOnlyHint: !!t.readOnly, destructiveHint: !!t.destructive, openWorldHint: false } })) });
       case 'tools/call': {
