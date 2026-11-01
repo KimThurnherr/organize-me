@@ -239,6 +239,13 @@
         </div>
         <div><button class="primary" type="submit">Speichern</button></div>
       </form>
+      <form class="card" id="weatherForm">
+        <h2>Wetter für Frostwarnungen</h2>
+        <p class="hint">Ort, an dem die Pflanzen stehen. Die App holt die Prognose für die nächsten 10 Tage und erinnert euch, Pflanzen mit Frostschwelle reinzuholen und danach wieder rauszustellen.</p>
+        <label for="wPlace">PLZ und Ort oder Koordinaten<input type="text" id="wPlace" maxlength="80" autocomplete="off" placeholder="z.B. 3011 Bern oder 46.95, 7.45"></label>
+        <p class="hint" id="wState"></p>
+        <div><button class="primary" type="submit" id="wSubmit">Speichern</button></div>
+      </form>
       <div class="card">
         <h2>Push auf diesem Gerät</h2>
         <p class="hint" id="pushState"></p>

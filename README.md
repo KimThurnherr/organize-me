@@ -20,6 +20,8 @@ Ohne externe Abhängigkeiten: Node 24 (`node:http`, `node:sqlite`, `node:crypto`
 | `ANTHROPIC_MODEL` | `claude-haiku-5-5` | Modell für die Pflegepläne |
 | `PLANT_REGION` | `Mitteleuropa` | Region bzw. Klima, auf das die Pflegepläne abgestimmt werden |
 | `PLANT_AI_PER_HOUR` | `30` | Höchstens so viele Pflegepläne pro Stunde |
+| `WEATHER_LAT` / `WEATHER_LON` / `WEATHER_PLACE` | | Optionaler Vorgabe-Ort für die Wetterprognose. Normalerweise wird der Ort in der App unter «Einstellungen» gesetzt (wird in der Datenbank gespeichert). |
+| `FROST_LOOKAHEAD` | `3` | Frost innerhalb so vieler Tage (heute eingeschlossen) löst die Erinnerung zum Reinholen aus |
 | `TZ` | `Europe/Zurich` | Zeitzone für Fälligkeiten und Push-Zeiten |
 
 ## Lokal starten
@@ -41,8 +43,12 @@ Push funktioniert nur, wenn die Seite in Safari über «Teilen» → «Zum Home-
 
 ## MCP-Schnittstelle
 
-`POST <PUBLIC_URL>/mcp` (Streamable HTTP, JSON-Antworten, zustandslos) mit `Authorization: Bearer <token>`. Mit einem persönlichen Token handelt der Aufruf im Namen dieser Person, mit dem gemeinsamen Token gibt der Parameter `person` an, wer handelt (erledigte Aufgaben zählen ohne Angabe für die zuständige Person). Werkzeuge: Überblick, Haushaltsaufgaben (anlegen, ändern, löschen, erledigen, nachtragen, Verlauf, Statistik), Gesundheits-Checkliste (Punkte verwalten, abhaken, Statistik), To-dos, Essensplan lesen und setzen, Einkaufsliste, Gäste und Besuche, Push-Zeiten und Teamziel, Pflanzen und Pflegeschritte (`add_plant` erstellt den Plan ohne mitgegebene Schritte per KI). Begrenzt auf 120 Anfragen pro Minute und Token.
+`POST <PUBLIC_URL>/mcp` (Streamable HTTP, JSON-Antworten, zustandslos) mit `Authorization: Bearer <token>`. Mit einem persönlichen Token handelt der Aufruf im Namen dieser Person, mit dem gemeinsamen Token gibt der Parameter `person` an, wer handelt (erledigte Aufgaben zählen ohne Angabe für die zuständige Person). Werkzeuge: Überblick, Haushaltsaufgaben (anlegen, ändern, löschen, erledigen, nachtragen, Verlauf, Statistik), Gesundheits-Checkliste (Punkte verwalten, abhaken, Statistik), To-dos, Essensplan lesen und setzen, Einkaufsliste, Gäste und Besuche, Push-Zeiten und Teamziel, Pflanzen und Pflegeschritte (`add_plant` erstellt den Plan ohne mitgegebene Schritte per KI), Frostwarnung (`frost_min`, `set_plant_frost`, `get_weather`, Ort über `update_settings`). Begrenzt auf 120 Anfragen pro Minute und Token.
 
 ## Pflanzen
 
-Pflanze und optional Standort eingeben, die App lässt von Claude einen Jahres-Pflegeplan erstellen (Rückschnitt, Winterschutz, Düngen, Giessen usw.). Jeder Pflegeschritt hat ein Zeitfenster (TT.MM. bis TT.MM., auch über den Jahreswechsel) und ist entweder einmal pro Fenster oder alle n Tage innerhalb des Fensters fällig. Fällige Schritte erscheinen auf «Heute» und im Morgen-Push beider Personen: einmalige zu Beginn des Fensters, danach wöchentlich und am letzten Tag, wiederkehrende am Fälligkeitstag. Ein fälliger Schritt gibt 5 Punkte. Pläne lassen sich von Hand anpassen oder neu erstellen.
+Pflanze und optional Standort eingeben, die App lässt von Claude einen Jahres-Pflegeplan erstellen (Rückschnitt, Winterschutz, Düngen, Giessen usw.). Jeder Pflegeschritt hat ein Zeitfenster (TT.MM. bis TT.MM., auch über den Jahreswechsel) und ist entweder einmal pro Fenster oder alle n Tage innerhalb des Fensters fällig. Fällige Schritte erscheinen auf «Heute» und im Morgen-Push beider Personen: einmalige zu Beginn des Fensters, danach wöchentlich und am letzten Tag, wiederkehrende am Fälligkeitstag. Ein fälliger Schritt gibt 5 Punkte. Pläne lassen sich von Hand anpassen oder neu erstellen. In der Liste sind die Pflanzen zugeklappt und zeigen nur ihren Status, aufgeklappte merkt sich das Gerät.
+
+### Frostwarnung
+
+Pflanzen, die draussen überwintern, aber starken Frost nicht sicher vertragen, bekommen eine Frostschwelle in °C (von Hand oder als Vorschlag der KI beim Pflegeplan). Unter «Einstellungen» wird der Ort gesetzt (PLZ und Ort, gesucht über die Open-Meteo-Ortssuche, oder Koordinaten). Die App holt alle paar Stunden die Tiefstwerte der nächsten 10 Tage bei Open-Meteo (ohne Schlüssel). Liegt ein Tag innerhalb von `FROST_LOOKAHEAD` Tagen bei oder unter der Schwelle, erscheint «vor Frost reinholen» auf «Heute» und im Push beider Personen (morgens, und abends wenn der Frost in der kommenden Nacht beginnt). Nach «Reingeholt» meldet die App, sobald kein Frost mehr in Sicht ist, dass die Pflanze wieder raus kann. Rechtzeitiges Quittieren gibt 5 Punkte. Ist die Prognose älter als 36 Stunden, gibt es keine Warnungen, sondern einen Hinweis.

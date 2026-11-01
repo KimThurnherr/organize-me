@@ -144,3 +144,9 @@ dialog.confirm .row { display: flex; justify-content: flex-end; gap: 8px; margin
 .memchip button { padding: 4px 8px; color: var(--muted); }
 
 .sym { font-family: system-ui, -apple-system, "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans Symbols", "Apple Symbols", "DejaVu Sans", sans-serif; font-weight: 400; font-style: normal; line-height: 1; vertical-align: baseline; font-variant-emoji: text; }
+button.plant-toggle { background: none; border: 0; padding: 0; width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; text-align: left; color: var(--fg); font-weight: inherit; }
+.plant-toggle h2 { margin: 0; }
+.plant-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.chev { width: 8px; height: 8px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(-45deg); margin: 0 4px 0 2px; transition: transform .15s ease; }
+.plant-toggle[aria-expanded="true"] .chev { transform: rotate(45deg); }
+.pill.wrap { white-space: normal; }

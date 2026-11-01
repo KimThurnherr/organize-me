@@ -24,6 +24,11 @@ const ANTHROPIC_API_KEY = env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL = env.ANTHROPIC_MODEL || 'claude-haiku-5-5';
 const PLANT_REGION = env.PLANT_REGION || 'Mitteleuropa';
 const PLANT_AI_PER_HOUR = +(env.PLANT_AI_PER_HOUR || 30);
+// Wetterprognose für Frostwarnungen (Open-Meteo, ohne Schlüssel). Der Ort wird in den Einstellungen gesetzt,
+// WEATHER_LAT/WEATHER_LON/WEATHER_PLACE sind nur Vorgabewerte.
+const WEATHER_URL = env.WEATHER_URL || 'https://api.open-meteo.com/v1/forecast';
+const GEOCODE_URL = env.GEOCODE_URL || 'https://geocoding-api.open-meteo.com/v1/search';
+const FROST_LOOKAHEAD = +(env.FROST_LOOKAHEAD || 3); // Frost innerhalb so vieler Tage (heute eingeschlossen) -> reinholen
 const ANTHROPIC_BASE_URL = (env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/$/, '');
 const SECURE_COOKIE = PUBLIC_URL.startsWith('https://');
 // ALLOWED_USERS="alex:alex@example.com,sam:sam@example.com" (Reihenfolge zählt für die Standard-Aufgaben)
@@ -67,6 +72,10 @@ db.exec(`
 CREATE TABLE IF NOT EXISTS plants (id INTEGER PRIMARY KEY, name TEXT NOT NULL, location TEXT, notes TEXT, botanical TEXT, summary TEXT, created_by TEXT, created_at TEXT, updated_at TEXT);
 CREATE TABLE IF NOT EXISTS plant_tasks (id INTEGER PRIMARY KEY, plant_id INTEGER NOT NULL REFERENCES plants(id) ON DELETE CASCADE, title TEXT NOT NULL, details TEXT, start_md TEXT NOT NULL, end_md TEXT NOT NULL, interval_days INTEGER, last_done TEXT, last_by TEXT, created_at TEXT);
 `);
+// Frostwarnung: frost_min = Tiefsttemperatur (°C), ab der die Pflanze vorübergehend reingeholt wird; frost_in = drinnen seit (Datum)
+for (const col of ['frost_min INTEGER', 'frost_in TEXT']) {
+  try { db.exec('ALTER TABLE plants ADD COLUMN ' + col); } catch { /* Spalte existiert schon */ }
+}
 const meta = {
   get: (k, d) => { const r = q('SELECT v FROM meta WHERE k=?').get(k); return r ? r.v : d; },
   set: (k, v) => q('INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v').run(k, String(v)),
@@ -264,6 +273,7 @@ function state(user) {
     mealIdeas: q('SELECT title, COUNT(*) AS n FROM meals GROUP BY lower(title) ORDER BY n DESC, max(date) DESC LIMIT 60').all().map(r => r.title),
     plants: plantsView(),
     plantsAi: !!ANTHROPIC_API_KEY,
+    weather: forecast(),
   };
 }
 
@@ -488,9 +498,89 @@ function plantRemindToday(t, st) {
 }
 const fmtMd = md => md ? +md.slice(3) + '.' + +md.slice(0, 2) + '.' : '';
 const plantRule = t => (t.start_md === '01-01' && t.end_md === '12-31' ? 'ganzjährig' : fmtMd(t.start_md) + '–' + fmtMd(t.end_md)) + (t.interval_days ? (t.interval_days === 1 ? ', täglich' : ', alle ' + t.interval_days + ' Tage') : ', einmal');
+// ---------- Wetter und Frostwarnung ----------
+function weatherConfig() {
+  const lat = parseFloat(meta.get('weather_lat', env.WEATHER_LAT || '')), lon = parseFloat(meta.get('weather_lon', env.WEATHER_LON || ''));
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return { lat, lon, place: meta.get('weather_place', env.WEATHER_PLACE || '') || null };
+}
+function weatherCache() { try { return JSON.parse(meta.get('weather_cache', '')); } catch { return null; } }
+let weatherBusy = false, weatherLastTry = 0;
+// Prognose höchstens alle 3 Stunden holen, nach einem Fehler frühestens nach 15 Minuten wieder versuchen
+async function refreshWeather(force) {
+  const cfg = weatherConfig(); if (!cfg || weatherBusy) return;
+  const c = weatherCache();
+  const fresh = c && c.lat === cfg.lat && c.lon === cfg.lon && Date.now() - Date.parse(c.fetched_at) < 3 * 36e5;
+  if (!force && (fresh || Date.now() - weatherLastTry < 15 * 6e4)) return;
+  weatherBusy = true; weatherLastTry = Date.now();
+  try {
+    const u = new URL(WEATHER_URL);
+    u.search = new URLSearchParams({ latitude: String(cfg.lat), longitude: String(cfg.lon), daily: 'temperature_2m_min,temperature_2m_max', timezone: TZ, forecast_days: '10' });
+    const r = await fetch(u, { headers: { 'User-Agent': 'flechte' }, signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json(), t = d?.daily?.time, mn = d?.daily?.temperature_2m_min, mx = d?.daily?.temperature_2m_max;
+    if (!Array.isArray(t) || !Array.isArray(mn)) throw new Error('unerwartete Antwort');
+    const days = t.map((date, i) => ({ date, min: typeof mn[i] === 'number' ? mn[i] : null, max: typeof mx?.[i] === 'number' ? mx[i] : null })).filter(x => isDate(x.date) && x.min !== null);
+    if (!days.length) throw new Error('keine Tageswerte');
+    meta.set('weather_cache', JSON.stringify({ lat: cfg.lat, lon: cfg.lon, fetched_at: nowIso(), days }));
+  } catch (e) { console.error('Wetter nicht abrufbar:', e.message); }
+  finally { weatherBusy = false; }
+}
+// Prognose ab heute; stale, wenn sie älter als 36 Stunden ist (dann keine Warnungen, sondern ein Hinweis)
+function forecast() {
+  const cfg = weatherConfig(); if (!cfg) return { configured: false, days: [] };
+  const c = weatherCache(), ok = !!c && c.lat === cfg.lat && c.lon === cfg.lon, today = localNow().date;
+  return { configured: true, place: cfg.place, lat: cfg.lat, lon: cfg.lon, fetched_at: ok ? c.fetched_at : null, stale: !ok || Date.now() - Date.parse(c.fetched_at) > 36 * 36e5, days: ok ? c.days.filter(d => d.date >= today) : [] };
+}
+async function geocode(input) {
+  const look = async name => {
+    const u = new URL(GEOCODE_URL); u.search = new URLSearchParams({ name, count: '10', language: 'de', format: 'json' });
+    let r; try { r = await fetch(u, { headers: { 'User-Agent': 'flechte' }, signal: AbortSignal.timeout(15000) }); } catch { fail(502, 'Ortssuche nicht erreichbar. Bitte später nochmals oder Koordinaten angeben.'); }
+    if (!r.ok) fail(502, 'Ortssuche fehlgeschlagen (Fehler ' + r.status + ').');
+    return (await r.json())?.results || [];
+  };
+  // PLZ (z.B. "8000 Zürich") zuerst über die Postleitzahl suchen, übrige Wörter filtern bei mehreren Treffern
+  const plz = input.match(/\b\d{4,5}\b/)?.[0], words = input.replace(/\b\d{4,5}\b/, '').toLowerCase().split(/[\s,]+/).filter(w => w.length > 1);
+  let res = plz ? await look(plz) : await look(input);
+  if (plz) res = res.filter(x => !x.postcodes || x.postcodes.includes(plz));
+  if (!res.length && !plz && words.length > 1) res = await look(words[0]);
+  if (res.length > 1 && words.length) { const hit = res.filter(x => words.some(w => [x.name, x.admin1, x.admin2, x.admin3, x.country, x.country_code].some(v => String(v || '').toLowerCase().includes(w)))); if (hit.length) res = hit; }
+  const g = res[0];
+  if (!g || !Number.isFinite(g.latitude) || !Number.isFinite(g.longitude)) fail(404, 'Ort nicht gefunden. Bitte PLZ und Ort oder Koordinaten (z.B. 47.37, 8.54) angeben.');
+  return { lat: g.latitude, lon: g.longitude, place: [plz, g.name].filter(Boolean).join(' ') + (g.admin1 ? ', ' + g.admin1 : '') };
+}
+const dm = s => s ? +s.slice(8) + '.' + +s.slice(5, 7) + '.' : '';
+const temp = n => String(Math.round(n * 10) / 10) + ' °C';
+// Frostlage einer Pflanze: action 'in' = vor Frost reinholen, 'out' = Frost vorbei, kann wieder raus
+function plantFrost(p, fc) {
+  if (p.frost_min === null || p.frost_min === undefined) return null;
+  const f = { min: p.frost_min, in_since: p.frost_in || null, action: null, configured: !!fc.configured, stale: fc.configured ? fc.stale : true, lowest: null, next: null };
+  if (!fc.configured || fc.stale || !fc.days.length) return f;
+  const today = dayNum(localNow().date);
+  f.lowest = fc.days.reduce((a, d) => (!a || d.min < a.min ? { date: d.date, min: d.min } : a), null);
+  const fd = fc.days.filter(d => d.min <= p.frost_min);
+  if (fd.length) {
+    // erste zusammenhängende Frostperiode
+    const byDay = new Map(fd.map(d => [dayNum(d.date), d.min])); let e = dayNum(fd[0].date), low = fd[0].min;
+    while (byDay.has(e + 1)) { e++; low = Math.min(low, byDay.get(e)); }
+    f.next = { from: fd[0].date, until: dateStr(e), lowest: low };
+  }
+  const soon = fd.some(d => dayNum(d.date) - today < FROST_LOOKAHEAD);
+  if (!p.frost_in && soon) f.action = 'in';
+  if (p.frost_in && !soon) f.action = 'out';
+  return f;
+}
+function frostText(p) {
+  const f = p.frost; if (!f?.action) return null;
+  if (f.action === 'out') return `${p.name} kann wieder raus, kein Frost bis ${temp(f.min)} mehr in Sicht`;
+  return `${p.name} reinholen, Frost ${f.next.until > f.next.from ? `vom ${dm(f.next.from)} bis ${dm(f.next.until)}` : `am ${dm(f.next.from)}`}, tiefstens ${temp(f.next.lowest)}`;
+}
+
 function plantsView() {
+  const fc = forecast();
   return q('SELECT * FROM plants ORDER BY name COLLATE NOCASE').all().map(p => ({
     ...p,
+    frost: plantFrost(p, fc),
     tasks: q('SELECT * FROM plant_tasks WHERE plant_id=?').all(p.id).map(t => ({ ...t, rule: plantRule(t), ...plantTaskStatus(t) }))
       .sort((a, b) => (b.due - a.due) || (b.active - a.active) || ((a.window_start || a.next_start || '') < (b.window_start || b.next_start || '') ? -1 : 1)),
   }));
@@ -507,7 +597,15 @@ function cleanPlan(raw) {
     title: str(t?.title, 80), details: str(t?.details, 500), start_md: toMd(t?.start), end_md: toMd(t?.end),
     interval_days: t?.interval_days === null || t?.interval_days === undefined || t?.interval_days === '' ? null : int(t.interval_days, 1, 120),
   })).filter(t => t.title && t.start_md && t.end_md);
-  return { summary: str(raw?.summary, 800), botanical: str(raw?.botanical_name, 80), tasks };
+  const fm = raw?.frost_min === null || raw?.frost_min === undefined || raw?.frost_min === '' ? null : int(raw.frost_min, -30, 10);
+  return { summary: str(raw?.summary, 800), botanical: str(raw?.botanical_name, 80), frost_min: fm, tasks };
+}
+// frost_min aus Anfrage: undefined = nicht angegeben, null = entfernen
+function readFrostMin(v) {
+  if (v === undefined) return undefined;
+  if (v === null || v === '') return null;
+  const n = int(v, -30, 10); if (n === null) fail(400, 'Frostwarnung: Temperatur -30 bis 10 °C oder leer');
+  return n;
 }
 const PLAN_TOOL = {
   name: 'pflegeplan',
@@ -517,6 +615,7 @@ const PLAN_TOOL = {
     properties: {
       botanical_name: { type: 'string', description: 'Botanischer Name der angenommenen Art' },
       summary: { type: 'string', description: 'Kurz: Winterhärte, Standort, Besonderheiten, getroffene Annahmen (max. 4 Sätze)' },
+      frost_min: { type: ['integer', 'null'], description: 'Tiefsttemperatur in °C, ab der die Pflanze vorübergehend reingeholt werden soll (z.B. -10). Nur für Pflanzen, die draussen überwintern, starken Frost aber nicht sicher vertragen; sonst null.' },
       tasks: {
         type: 'array', minItems: 1, maxItems: 15,
         items: {
@@ -532,7 +631,7 @@ const PLAN_TOOL = {
         },
       },
     },
-    required: ['botanical_name', 'summary', 'tasks'],
+    required: ['botanical_name', 'summary', 'frost_min', 'tasks'],
   },
 };
 let aiCalls = [];
@@ -541,7 +640,7 @@ async function aiPlantPlan(p) {
   aiCalls = aiCalls.filter(t => Date.now() - t < 36e5);
   if (aiCalls.length >= PLANT_AI_PER_HOUR) fail(429, 'Zu viele Pflegepläne in der letzten Stunde. Bitte später nochmals.');
   aiCalls.push(Date.now());
-  const system = `Du bist erfahrene Gärtnerin für Haus- und Hobbygarten in der Region ${PLANT_REGION}. Erstelle für die genannte Pflanze einen praxistauglichen Jahres-Pflegeplan mit den wichtigen Arbeiten: Rückschnitt, Winterschutz bzw. Einräumen und Ausräumen, Düngen, Giessen, Umtopfen, Ernte, Vermehrung, wo sinnvoll. Berücksichtige den Standort (z.B. Topf, Beet, drinnen). Regeln: 3 bis 10 Aufgaben, nur was für diese Pflanze wirklich nötig ist. Zeitfenster realistisch für die Region (MM-TT). interval_days nur für regelmässige Arbeiten im Fenster (Giessen im Topf, Düngen), nicht kürzer als 2 Tage, sonst null. Giessen nur aufnehmen, wenn es eine feste Regel braucht (Topfpflanzen im Sommer, Überwinterung drinnen). Jede Arbeit nur einmal: keine zwei Rückschnitte oder überlappenden Giess-Aufgaben, sondern zusammenfassen. Laufende Ernte nicht als eigene Aufgabe, ausser es gibt einen klaren Erntezeitpunkt. Wenn die Pflanze mehrdeutig ist, nimm die gängigste Gartenart an und nenne die Annahme in summary. Schreibe Deutsch in Schweizer Rechtschreibung (ss statt ß), knapp und konkret, ohne Emojis.`;
+  const system = `Du bist erfahrene Gärtnerin für Haus- und Hobbygarten in der Region ${PLANT_REGION}. Erstelle für die genannte Pflanze einen praxistauglichen Jahres-Pflegeplan mit den wichtigen Arbeiten: Rückschnitt, Winterschutz bzw. Einräumen und Ausräumen, Düngen, Giessen, Umtopfen, Ernte, Vermehrung, wo sinnvoll. Berücksichtige den Standort (z.B. Topf, Beet, drinnen). Regeln: 3 bis 10 Aufgaben, nur was für diese Pflanze wirklich nötig ist. Zeitfenster realistisch für die Region (MM-TT). interval_days nur für regelmässige Arbeiten im Fenster (Giessen im Topf, Düngen), nicht kürzer als 2 Tage, sonst null. Giessen nur aufnehmen, wenn es eine feste Regel braucht (Topfpflanzen im Sommer, Überwinterung drinnen). Jede Arbeit nur einmal: keine zwei Rückschnitte oder überlappenden Giess-Aufgaben, sondern zusammenfassen. Laufende Ernte nicht als eigene Aufgabe, ausser es gibt einen klaren Erntezeitpunkt. Vorübergehendes Reinholen bei starkem Frost nicht als Aufgabe planen, sondern über frost_min angeben: Die App prüft dafür die Wetterprognose und erinnert selbst. Wenn die Pflanze mehrdeutig ist, nimm die gängigste Gartenart an und nenne die Annahme in summary. Schreibe Deutsch in Schweizer Rechtschreibung (ss statt ß), knapp und konkret, ohne Emojis.`;
   const user = `Pflanze: ${p.name}\nStandort: ${p.location || 'nicht angegeben'}\nNotiz: ${p.notes || '-'}\nHeutiges Datum: ${localNow().date}`;
   let r;
   try {
@@ -566,6 +665,8 @@ function savePlan(plantId, plan) {
     const ins = q('INSERT INTO plant_tasks(plant_id,title,details,start_md,end_md,interval_days,created_at) VALUES(?,?,?,?,?,?,?)');
     for (const t of plan.tasks) ins.run(plantId, t.title, t.details || null, t.start_md, t.end_md, t.interval_days, nowIso());
     q('UPDATE plants SET botanical=?, summary=?, updated_at=? WHERE id=?').run(plan.botanical || null, plan.summary || null, nowIso(), plantId);
+    // Vorschlag der KI nur übernehmen, wenn noch keine Frostschwelle gesetzt ist
+    if (plan.frost_min !== null && plan.frost_min !== undefined) q('UPDATE plants SET frost_min=? WHERE id=? AND frost_min IS NULL').run(plan.frost_min, plantId);
     db.exec('COMMIT');
   } catch (e) { db.exec('ROLLBACK'); throw e; }
 }
@@ -588,17 +689,51 @@ Object.assign(ops, {
     if (!name) fail(400, 'Bitte die Pflanze angeben.');
     const plan = Array.isArray(b.tasks) ? cleanPlan({ tasks: b.tasks, summary: b.summary, botanical_name: b.botanical_name }) : await aiPlantPlan({ name, location, notes });
     if (Array.isArray(b.tasks) && !plan.tasks.length) fail(400, 'Keine gültigen Pflegeschritte (title, start, end als MM-TT oder TT.MM.)');
-    const r = q('INSERT INTO plants(name,location,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?)').run(name, location || null, notes || null, user, nowIso(), nowIso());
+    const fm = readFrostMin(b.frost_min);
+    const r = q('INSERT INTO plants(name,location,notes,frost_min,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?)').run(name, location || null, notes || null, fm ?? null, user, nowIso(), nowIso());
     const id = Number(r.lastInsertRowid);
     savePlan(id, plan);
-    return { ok: true, id, tasks: plan.tasks.length };
+    return { ok: true, id, tasks: plan.tasks.length, frost_min: ops.plantGet(id).frost_min };
   },
   plantUpdate(id, b) {
     const p = ops.plantGet(id);
     const name = b.name !== undefined ? str(b.name, 80) : p.name, location = b.location !== undefined ? str(b.location, 80) : (p.location || ''), notes = b.notes !== undefined ? str(b.notes, 300) : (p.notes || '');
     if (!name) fail(400, 'Name darf nicht leer sein');
-    q('UPDATE plants SET name=?, location=?, notes=?, updated_at=? WHERE id=?').run(name, location || null, notes || null, nowIso(), p.id);
+    const fmIn = readFrostMin(b.frost_min), fm = fmIn === undefined ? p.frost_min : fmIn;
+    q('UPDATE plants SET name=?, location=?, notes=?, frost_min=?, frost_in=?, updated_at=? WHERE id=?').run(name, location || null, notes || null, fm ?? null, fm === null || fm === undefined ? null : p.frost_in, nowIso(), p.id);
     return { ok: true };
+  },
+  // Vor Frost reingeholt (in) oder wieder rausgestellt (out); wenn es gerade fällig war, 5 Punkte
+  plantFrostSet(user, id, action) {
+    const p = ops.plantGet(id), today = localNow().date;
+    if (p.frost_min === null) fail(400, 'Für diese Pflanze ist keine Frostwarnung eingerichtet.');
+    if (action !== 'in' && action !== 'out') fail(400, 'action: in (reingeholt) oder out (wieder rausgestellt)');
+    if (action === 'in' && p.frost_in) fail(409, p.name + ' ist schon drinnen');
+    if (action === 'out' && !p.frost_in) fail(409, p.name + ' ist schon draussen');
+    const was = plantFrost(p, forecast())?.action;
+    q('UPDATE plants SET frost_in=? WHERE id=?').run(action === 'in' ? today : null, p.id);
+    const ref = p.id + ':frost-' + action;
+    const points = was === action && !q("SELECT 1 FROM log WHERE type='plant' AND ref=? AND date=?").get(ref, today) ? 5 : 0;
+    if (points) addLog(user, points, 'plant', p.name + ': ' + (action === 'in' ? 'vor Frost reingeholt' : 'wieder rausgestellt'), ref, today);
+    return { ok: true, points };
+  },
+  // Ort für die Wetterprognose: PLZ/Ort (wird gesucht) oder Koordinaten; leerer Ort entfernt ihn
+  async weatherSet(b) {
+    const place = str(b.place, 80);
+    let lat = b.lat === undefined || b.lat === null || b.lat === '' ? null : Number(b.lat), lon = b.lon === undefined || b.lon === null || b.lon === '' ? null : Number(b.lon), label = place;
+    if (lat === null && lon === null && !place) { q("DELETE FROM meta WHERE k IN ('weather_lat','weather_lon','weather_place','weather_cache')").run(); return { ok: true, removed: true }; }
+    if (lat === null || lon === null) {
+      const m = place.match(/^(-?\d{1,2}(?:\.\d+)?)\s*[,;]\s*(-?\d{1,3}(?:\.\d+)?)$/);
+      if (m) { lat = +m[1]; lon = +m[2]; label = ''; }
+      else if (place) ({ lat, lon, place: label } = await geocode(place));
+      else fail(400, 'Bitte Ort oder lat und lon angeben.');
+    }
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) fail(400, 'Ungültige Koordinaten');
+    lat = Math.round(lat * 1e4) / 1e4; lon = Math.round(lon * 1e4) / 1e4;
+    meta.set('weather_lat', lat); meta.set('weather_lon', lon); meta.set('weather_place', label || `${lat}, ${lon}`);
+    await refreshWeather(true);
+    const fc = forecast();
+    return { ok: true, place: fc.place, lat, lon, forecast_ok: !fc.stale, lowest: fc.days.length ? fc.days.reduce((a, d) => (d.min < a.min ? d : a)) : null };
   },
   async plantRegenerate(id) { const p = ops.plantGet(id); const plan = await aiPlantPlan(p); savePlan(p.id, plan); return { ok: true, tasks: plan.tasks.length }; },
   plantDelete(id) { const p = ops.plantGet(id); q('DELETE FROM plant_tasks WHERE plant_id=?').run(p.id); q('DELETE FROM plants WHERE id=?').run(p.id); q("DELETE FROM log WHERE type='plant' AND ref LIKE ?").run(p.id + ':%'); return { ok: true }; },
@@ -734,7 +869,9 @@ async function api(req, res, user, route) {
     if ((mm = route.match(/^shopping\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.shopUpdate(mm[1], body));
     if ((mm = route.match(/^shopping\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.shopDelete(mm[1]));
     if ((mm = route.match(/^shopping\/(\d+)\/done$/)) && m === 'POST') return send(res, 200, ops.shopSetDone(user, mm[1], !!body.done));
-    if (m === 'POST' && route === 'plants') return send(res, 200, await ops.plantAdd(user, { name: body.name, location: body.location, notes: body.notes }));
+    if (m === 'POST' && route === 'plants') return send(res, 200, await ops.plantAdd(user, { name: body.name, location: body.location, notes: body.notes, frost_min: body.frost_min }));
+    if ((mm = route.match(/^plants\/(\d+)\/frost$/)) && m === 'POST') return send(res, 200, ops.plantFrostSet(user, mm[1], body.action));
+    if (m === 'POST' && route === 'settings/weather') return send(res, 200, await ops.weatherSet({ place: body.place }));
     if ((mm = route.match(/^plants\/(\d+)$/)) && m === 'PATCH') return send(res, 200, ops.plantUpdate(mm[1], body));
     if ((mm = route.match(/^plants\/(\d+)$/)) && m === 'DELETE') return send(res, 200, ops.plantDelete(mm[1]));
     if ((mm = route.match(/^plants\/(\d+)\/regenerate$/)) && m === 'POST') return send(res, 200, await ops.plantRegenerate(mm[1]));
@@ -853,6 +990,9 @@ function buildMessage(user, slot) {
     const pt = duePlantTasks().filter(t => plantRemindToday(t, t));
     if (pt.length) lines.push('Pflanzen: ' + pt.slice(0, 4).map(t => `${t.plant}: ${t.title}`).join(', ') + (pt.length > 4 ? ' …' : ''));
   }
+  // Frost an beide: reinholen morgens und, wenn der Frost heute Nacht oder morgen kommt, auch abends; wieder raus nur morgens
+  const fr = plantsView().filter(p => p.frost?.action === 'out' ? slot === 'morning' : p.frost?.action === 'in' && (slot === 'morning' || dayNum(p.frost.next.from) - dnum <= 1)).map(frostText);
+  if (fr.length) lines.unshift('Frost: ' + fr.join('; '));
   if (slot === 'evening') {
     const due = longAbsentGuests().filter(g => { const r = q('SELECT date FROM guest_reminders WHERE guest_id=? AND user=?').get(g.id, user); return !r || dnum - dayNum(r.date) >= GUEST_REMIND_REPEAT; });
     if (due.length) {
@@ -895,7 +1035,8 @@ async function scheduler() {
   }
   q('DELETE FROM push_sent WHERE date < ?').run(new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10));
 }
-setInterval(() => { try { awardDueVisits(); } catch (e) { console.error('Besuchspunkte', e); } scheduler().catch(e => console.error('Scheduler', e)); }, 60 * 1000);
+setInterval(() => { try { awardDueVisits(); } catch (e) { console.error('Besuchspunkte', e); } refreshWeather().catch(e => console.error('Wetter', e)).finally(() => scheduler().catch(e => console.error('Scheduler', e))); }, 60 * 1000);
+refreshWeather().catch(e => console.error('Wetter', e));
 
 // ---------- Google-Login ----------
 const REDIRECT_URI = PUBLIC_URL + '/auth/callback';
@@ -973,6 +1114,7 @@ function overview() {
     shopping_open: q('SELECT id, name, qty FROM shopping WHERE done=0 ORDER BY id').all(),
     guests: { last_visit: lastVisit, planned_visits: planned, days_since: lastVisit ? dayNum(today) - dayNum(lastVisit) : null, goal: 'jede Woche jemand zu Gast', long_absent: longAbsentGuests(), long_absent_threshold_days: GUEST_REMIND_DAYS },
     due_plant_tasks: duePlantTasks().map(plantTaskMcp),
+    frost_alerts: plantsView().filter(p => p.frost?.action).map(p => ({ plant_id: p.id, plant: p.name, action: p.frost.action, text: frostText(p), frost_min: p.frost.min, next_frost: p.frost.next })),
   };
 }
 const P = (type, description, extra = {}) => ({ type, description, ...extra });
@@ -1007,11 +1149,17 @@ const MCP_TOOLS = [
   { name: 'log_visit', description: 'Besuch eintragen oder planen. Vergangene/heutige Besuche geben beiden Personen sofort je 10 Punkte; Besuche in der Zukunft gelten als geplant, die Punkte kommen automatisch am Besuchstag.', inputSchema: { type: 'object', properties: { date: P('string', 'YYYY-MM-DD, Zukunft = geplant (max. 1 Jahr voraus)'), guest_ids: { type: 'array', items: { type: 'integer' }, description: 'IDs aus list_guests' }, note: P('string', 'Notiz (optional)'), person: PERSON }, required: ['date', 'guest_ids'] }, run: (u, a) => ops.visitAdd(actor(u, a, Object.keys(USERS)[0]), { date: a.date, guestIds: a.guest_ids, note: a.note }) },
   { name: 'list_visits', description: 'Besuche inkl. geplanter (planned=true), neueste zuerst.', inputSchema: { type: 'object', properties: { limit: P('integer', 'Anzahl, Standard 20') } }, readOnly: true, run: (u, a) => q('SELECT id, date, note FROM visits ORDER BY date DESC, id DESC LIMIT ?').all(int(a.limit, 1, 200) || 20).map(v => ({ ...v, planned: v.date > localNow().date, guests: q('SELECT g.name FROM visit_guests vg JOIN guests g ON g.id=vg.guest_id WHERE vg.visit_id=?').all(v.id).map(r => r.name) })) },
   { name: 'delete_visit', description: 'Besuch löschen (Punkte werden zurückgenommen).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID') }, required: ['id'] }, destructive: true, run: (u, a) => ops.visitDelete(a.id) },
-  { name: 'get_settings', description: 'Push-Zeiten beider Personen und Teamziel.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => ({ push_times: Object.keys(USERS).map(k => ({ person: k, ...(q('SELECT morning, evening FROM user_settings WHERE user=?').get(k) || { morning: '09:00', evening: '18:00' }) })), team_goal: +meta.get('team_goal', 120) }) },
-  { name: 'update_settings', description: 'Push-Zeiten (HH:MM) einer Person und/oder das gemeinsame Wochen-Teamziel ändern. Für Push-Zeiten ist person nötig.', inputSchema: { type: 'object', properties: { person: PERSON, morning: P('string', 'HH:MM'), evening: P('string', 'HH:MM'), team_goal: P('integer', 'Punkte pro Woche (10-2000)') } }, run: (u, a) => {
-      if (a.morning === undefined && a.evening === undefined) { if (a.team_goal === undefined) fail(400, 'Nichts zu ändern'); const g = int(a.team_goal, 10, 2000); if (!g) fail(400, 'Ungültiges Teamziel (10-2000)'); meta.set('team_goal', g); return { ok: true }; }
-      return ops.settingsSet(actor(u, a), { morning: a.morning, evening: a.evening, teamGoal: a.team_goal });
+  { name: 'get_settings', description: 'Push-Zeiten beider Personen, Teamziel und Ort der Wetterprognose für Frostwarnungen.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => { const w = weatherConfig(); return { push_times: Object.keys(USERS).map(k => ({ person: k, ...(q('SELECT morning, evening FROM user_settings WHERE user=?').get(k) || { morning: '09:00', evening: '18:00' }) })), team_goal: +meta.get('team_goal', 120), weather_location: w }; } },
+  { name: 'update_settings', description: 'Push-Zeiten (HH:MM) einer Person, das gemeinsame Wochen-Teamziel und/oder den Ort der Wetterprognose für Frostwarnungen ändern. Für Push-Zeiten ist person nötig.', inputSchema: { type: 'object', properties: { person: PERSON, morning: P('string', 'HH:MM'), evening: P('string', 'HH:MM'), team_goal: P('integer', 'Punkte pro Woche (10-2000)'), weather_place: P('string', 'Ort der Pflanzen für die Wetterprognose: PLZ und Ort (wird gesucht) oder Koordinaten "lat, lon". Leerer String entfernt den Ort.'), weather_lat: P('number', 'Breitengrad (statt Ortssuche, zusammen mit weather_lon)'), weather_lon: P('number', 'Längengrad') } }, run: async (u, a) => {
+      const out = { ok: true };
+      if (a.weather_place !== undefined || a.weather_lat !== undefined || a.weather_lon !== undefined) out.weather = await ops.weatherSet({ place: a.weather_place, lat: a.weather_lat, lon: a.weather_lon });
+      if (a.morning === undefined && a.evening === undefined) {
+        if (a.team_goal === undefined) { if (!out.weather) fail(400, 'Nichts zu ändern'); return out; }
+        const g = int(a.team_goal, 10, 2000); if (!g) fail(400, 'Ungültiges Teamziel (10-2000)'); meta.set('team_goal', g); return out;
+      }
+      return { ...out, ...ops.settingsSet(actor(u, a), { morning: a.morning, evening: a.evening, teamGoal: a.team_goal }) };
     } },
+  { name: 'get_weather', description: 'Wetterprognose der nächsten 10 Tage (Tiefst-/Höchstwerte) am eingestellten Ort, die für die Frostwarnungen der Pflanzen verwendet wird.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => forecast() },
   { name: 'get_chore_history', description: 'Verlauf: wann welche Haushaltsaufgabe von wem erledigt wurde, für einen Monat.', inputSchema: { type: 'object', properties: { month: P('string', 'YYYY-MM, Standard aktueller Monat'), chore_id: P('integer', 'Nur diese Aufgabe (optional)') } }, readOnly: true, run: (u, a) => ({ month: monthOf(a.month), entries: choreHistory(a.month, a.chore_id) }) },
   { name: 'get_chore_stats', description: 'Monatsstatistik Haushalt: Anzahl Erledigungen pro Aufgabe und Person, erwartete Anzahl laut Intervall, durchschnittlicher Abstand, pünktlich/verspätet.', inputSchema: { type: 'object', properties: { month: P('string', 'YYYY-MM, Standard aktueller Monat') } }, readOnly: true, run: (u, a) => choreStats(a.month) },
   { name: 'delete_chore_completion', description: 'Eine Erledigung aus dem Verlauf löschen (z.B. versehentlich abgehakt). Punkte werden zurückgenommen.', inputSchema: { type: 'object', properties: { log_id: P('integer', 'log_id aus get_chore_history') }, required: ['log_id'] }, destructive: true, run: (u, a) => ops.choreCompletionDelete(a.log_id) },
@@ -1046,17 +1194,18 @@ const MCP_TOOLS = [
   { name: 'get_shopping_suggestions', description: 'Gedächtnis der Einkaufsliste: früher erfasste Artikel mit Häufigkeit.', inputSchema: { type: 'object', properties: { query: P('string', 'Filter (optional)') } }, readOnly: true, run: (u, a) => q('SELECT name, n AS times, last FROM shopping_names WHERE name LIKE ? ORDER BY n DESC, last DESC LIMIT 100').all('%' + str(a.query, 80) + '%') },
   { name: 'forget_shopping_suggestion', description: 'Einen Artikel aus dem Gedächtnis der Einkaufsliste entfernen (z.B. Tippfehler), damit er nicht mehr vorgeschlagen wird.', inputSchema: { type: 'object', properties: { name: P('string', 'Exakter Name') }, required: ['name'] }, destructive: true, run: (u, a) => ops.shopForget(a.name) },
   { name: 'clear_bought_items', description: 'Alle als gekauft markierten Artikel von der Liste entfernen.', inputSchema: { type: 'object', properties: {} }, destructive: true, run: () => ops.shopClearDone() },
-  { name: 'list_plants', description: 'Pflanzen mit Standort, Pflegehinweis und Jahres-Pflegeplan (Zeitfenster, Intervall, ob jetzt fällig).', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => plantsView().map(p => ({ id: p.id, name: p.name, location: p.location, notes: p.notes, botanical: p.botanical, summary: p.summary, tasks: p.tasks.map(plantTaskMcp) })) },
-  { name: 'add_plant', description: 'Pflanze erfassen. Ohne tasks erstellt die App den Pflegeplan selbst per KI (dauert einige Sekunden); mit tasks wird der mitgegebene Plan gespeichert.', inputSchema: { type: 'object', properties: { name: P('string', 'Pflanze, z.B. Rosmarin'), location: P('string', 'Standort, z.B. Topf an der Hauswand (optional)'), notes: P('string', 'Notiz, z.B. Sorte (optional)'), summary: P('string', 'Kurzer Pflegehinweis, nur zusammen mit tasks'), tasks: { type: 'array', maxItems: 20, items: { type: 'object', properties: TASK_PROPS, required: ['title', 'start', 'end'] } }, person: PERSON }, required: ['name'] }, run: (u, a) => ops.plantAdd(actor(u, a, Object.keys(USERS)[0]), a) },
-  { name: 'update_plant', description: 'Name, Standort oder Notiz einer Pflanze ändern.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Pflanze'), name: P('string', 'Neuer Name'), location: P('string', 'Neuer Standort, leer entfernt'), notes: P('string', 'Neue Notiz, leer entfernt') }, required: ['id'] }, run: (u, a) => ops.plantUpdate(a.id, a) },
+  { name: 'list_plants', description: 'Pflanzen mit Standort, Pflegehinweis, Jahres-Pflegeplan (Zeitfenster, Intervall, ob jetzt fällig) und Frostwarnung (frost_min, Lage laut Prognose: action in = reinholen, out = kann wieder raus).', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => plantsView().map(p => ({ id: p.id, name: p.name, location: p.location, notes: p.notes, botanical: p.botanical, summary: p.summary, frost_min: p.frost_min, frost: p.frost ? { ...p.frost, text: frostText(p) } : null, tasks: p.tasks.map(plantTaskMcp) })) },
+  { name: 'add_plant', description: 'Pflanze erfassen. Ohne tasks erstellt die App den Pflegeplan selbst per KI (dauert einige Sekunden); mit tasks wird der mitgegebene Plan gespeichert.', inputSchema: { type: 'object', properties: { name: P('string', 'Pflanze, z.B. Rosmarin'), location: P('string', 'Standort, z.B. Topf an der Hauswand (optional)'), notes: P('string', 'Notiz, z.B. Sorte (optional)'), frost_min: P('integer', 'Frostwarnung: ab dieser Tiefsttemperatur (°C, -30 bis 10) laut Prognose erinnert die App, die Pflanze reinzuholen (optional, sonst schlägt die KI einen Wert vor oder keinen)'), summary: P('string', 'Kurzer Pflegehinweis, nur zusammen mit tasks'), tasks: { type: 'array', maxItems: 20, items: { type: 'object', properties: TASK_PROPS, required: ['title', 'start', 'end'] } }, person: PERSON }, required: ['name'] }, run: (u, a) => ops.plantAdd(actor(u, a, Object.keys(USERS)[0]), a) },
+  { name: 'update_plant', description: 'Name, Standort, Notiz oder Frostwarnung einer Pflanze ändern.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Pflanze'), name: P('string', 'Neuer Name'), location: P('string', 'Neuer Standort, leer entfernt'), notes: P('string', 'Neue Notiz, leer entfernt'), frost_min: { type: ['integer', 'null'], description: 'Frostwarnung ab dieser Tiefsttemperatur in °C (-30 bis 10), null entfernt sie' } }, required: ['id'] }, run: (u, a) => ops.plantUpdate(a.id, a) },
   { name: 'regenerate_plant_plan', description: 'Pflegeplan einer Pflanze per KI neu erstellen (ersetzt alle Pflegeschritte), z.B. nach Standortwechsel.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Pflanze') }, required: ['id'] }, destructive: true, run: (u, a) => ops.plantRegenerate(a.id) },
   { name: 'delete_plant', description: 'Pflanze samt Pflegeplan löschen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Pflanze') }, required: ['id'] }, destructive: true, run: (u, a) => ops.plantDelete(a.id) },
   { name: 'add_plant_task', description: 'Pflegeschritt zu einer Pflanze hinzufügen.', inputSchema: { type: 'object', properties: { plant_id: P('integer', 'ID der Pflanze'), ...TASK_PROPS }, required: ['plant_id', 'title', 'start', 'end'] }, run: (u, a) => ops.plantTaskAdd(a.plant_id, a) },
   { name: 'update_plant_task', description: 'Pflegeschritt ändern (nur angegebene Felder).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID des Pflegeschritts'), ...TASK_PROPS }, required: ['id'] }, run: (u, a) => ops.plantTaskUpdate(a.id, a) },
   { name: 'delete_plant_task', description: 'Pflegeschritt löschen.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID des Pflegeschritts') }, required: ['id'] }, destructive: true, run: (u, a) => ops.plantTaskDelete(a.id) },
   { name: 'complete_plant_task', description: 'Pflegeschritt heute als erledigt markieren. Fällige Schritte geben 5 Punkte fürs Teamziel.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID des Pflegeschritts'), person: PERSON }, required: ['id'] }, run: (u, a) => ops.plantTaskDone(actor(u, a), a.id) },
+  { name: 'set_plant_frost', description: 'Frostwarnung quittieren: Pflanze vor Frost reingeholt (in) oder wieder rausgestellt (out). War es laut Prognose gerade fällig, gibt es 5 Punkte.', inputSchema: { type: 'object', properties: { id: P('integer', 'ID der Pflanze'), action: { type: 'string', enum: ['in', 'out'], description: 'in = reingeholt, out = wieder rausgestellt' }, person: PERSON }, required: ['id', 'action'] }, run: (u, a) => ops.plantFrostSet(actor(u, a), a.id, a.action) },
 ];
-const MCP_INSTRUCTIONS = 'Flechte ist die Haushalts-App eines Paares: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (Ziel: jede Woche jemand zu Gast) und ein gemeinsames Wochen-Teamziel in Punkten. Dazu gibt es eine gemeinsame Einkaufsliste, eine tägliche Gesundheits-Checkliste pro Person mit Monatsstatistik sowie einen Verlauf und eine Monatsstatistik der Haushaltsaufgaben und Pflanzen mit Jahres-Pflegeplan (Pflegeschritte mit Zeitfenster MM-TT, Erinnerung an beide). Rufe zuerst get_overview auf. Daten sind auf Deutsch, Datumsformat YYYY-MM-DD, Zeitzone ' + TZ + '. Das Konto kann von beiden Personen gemeinsam genutzt werden: Gib bei Aktionen, die einer Person zugerechnet werden, den Parameter person an und frage nach, wenn nicht klar ist, wer gerade schreibt. Haushaltsaufgaben haben eine feste zuständige Person (assignee).';
+const MCP_INSTRUCTIONS = 'Flechte ist die Haushalts-App eines Paares: wiederkehrende Aufgaben mit fester Zuständigkeit, To-dos, Essensplan (sonntags für die nächste Woche planen), Gäste-Rhythmus (Ziel: jede Woche jemand zu Gast) und ein gemeinsames Wochen-Teamziel in Punkten. Dazu gibt es eine gemeinsame Einkaufsliste, eine tägliche Gesundheits-Checkliste pro Person mit Monatsstatistik sowie einen Verlauf und eine Monatsstatistik der Haushaltsaufgaben und Pflanzen mit Jahres-Pflegeplan (Pflegeschritte mit Zeitfenster MM-TT, Erinnerung an beide) sowie Frostwarnung: Pflanzen mit frost_min werden anhand der Wetterprognose am eingestellten Ort zum Reinholen und Wieder-Rausstellen gemeldet. Rufe zuerst get_overview auf. Daten sind auf Deutsch, Datumsformat YYYY-MM-DD, Zeitzone ' + TZ + '. Das Konto kann von beiden Personen gemeinsam genutzt werden: Gib bei Aktionen, die einer Person zugerechnet werden, den Parameter person an und frage nach, wenn nicht klar ist, wer gerade schreibt. Haushaltsaufgaben haben eine feste zuständige Person (assignee).';
 const mcpRate = new Map();
 async function handleMcp(req, res) {
   if (req.method === 'GET' || req.method === 'DELETE') return send(res, 405, { error: 'Nur POST' }, undefined, { Allow: 'POST' });
@@ -1071,7 +1220,7 @@ async function handleMcp(req, res) {
     const isNote = msg.id === undefined;
     const ok = result => isNote ? null : { jsonrpc: '2.0', id: msg.id, result };
     switch (msg.method) {
-      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.5.0' }, instructions: MCP_INSTRUCTIONS });
+      case 'initialize': return ok({ protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'flechte', title: 'Flechte Haushalt', version: '1.6.0' }, instructions: MCP_INSTRUCTIONS });
       case 'ping': return ok({});
       case 'tools/list': return ok({ tools: MCP_TOOLS.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, annotations: { readOnlyHint: !!t.readOnly, destructiveHint: !!t.destructive, openWorldHint: false } })) });
       case 'tools/call': {

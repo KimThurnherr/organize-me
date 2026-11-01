@@ -3,6 +3,9 @@ const $ = id => document.getElementById(id);
 let S = null, tab = 'home', pending = null, editing = null, selected = new Set(), busy = false;
 let weekOffset = null, mealsDirty = false, mealsKey = '';
 let plEditing = null, ptEditing = null;
+// Aufgeklappte Pflanzen (Standard: alle zu), pro Gerät gemerkt
+let plOpen = new Set(); try { plOpen = new Set(JSON.parse(localStorage.getItem('flechte_plants_open') || '[]')); } catch { /* kein Speicher */ }
+const savePlOpen = () => { try { localStorage.setItem('flechte_plants_open', JSON.stringify([...plOpen])); } catch { /* kein Speicher */ } };
 let H = null, hDate = null, hMonth = null, hPerson = null, hEditing = null, CH = null, cMonth = null;
 const MONTHS = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
 const WDS = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
@@ -232,6 +235,13 @@ function render() {
   if (document.activeElement?.closest('#settingsForm') == null) {
     $('sMorning').value = S.settings.morning; $('sEvening').value = S.settings.evening; $('sGoal').value = S.teamGoal;
   }
+  if (document.activeElement !== $('wPlace')) $('wPlace').value = S.weather?.configured ? S.weather.place || '' : '';
+  {
+    const w = S.weather, ws = $('wState');
+    if (!w?.configured) ws.textContent = 'Noch kein Ort gesetzt, Frostwarnungen sind aus.';
+    else if (w.stale || !w.days.length) ws.textContent = 'Koordinaten ' + w.lat + ', ' + w.lon + '. Die Prognose konnte zuletzt nicht abgerufen werden.';
+    else { const lo = w.days.reduce((a, d) => d.min < a.min ? d : a); ws.textContent = 'Koordinaten ' + w.lat + ', ' + w.lon + ' · Prognose vom ' + fmt(w.fetched_at.slice(0, 10)) + ' · tiefstens ' + tmp(lo.min) + ' am ' + shortDate(lo.date); }
+  }
 }
 
 const WD = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
@@ -448,6 +458,25 @@ function plantStatus(t) {
   if (t.active && t.last_done) return '<span class="pill ok">erledigt ' + shortDate(t.last_done) + '</span>' + (t.next_start ? ' · wieder ab ' + shortDate(t.next_start) : '');
   return 'ab ' + shortDate(t.next_start);
 }
+const tmp = n => (Math.round(n * 10) / 10) + ' °C';
+const frostSpan = n => (n.until > n.from ? shortDate(n.from) + ' bis ' + shortDate(n.until) : 'am ' + shortDate(n.from)) + ', tiefstens ' + tmp(n.lowest);
+// Frostwarnung einer Pflanze: Zeile mit Status und passender Schaltfläche
+function frostLine(p) {
+  const f = p.frost; if (!f) return null;
+  let st;
+  if (!f.configured) st = '<span class="pill">Ort für die Prognose fehlt (Einstellungen)</span>';
+  else if (f.stale) st = '<span class="pill">Prognose gerade nicht verfügbar</span>';
+  else if (f.action === 'in') st = '<span class="pill bad wrap">reinholen: ' + frostSpan(f.next) + '</span>';
+  else if (f.action === 'out') st = '<span class="pill warn">Frost vorbei, kann wieder raus</span>';
+  else if (f.in_since) st = '<span class="pill">drinnen seit ' + shortDate(f.in_since) + '</span>' + (f.next ? ' · Frost bis ' + shortDate(f.next.until) : '');
+  else if (f.next) st = '<span class="pill warn wrap">Frost erwartet ' + frostSpan(f.next) + '</span>';
+  else st = '<span class="pill ok">kein Frost in Sicht</span>' + (f.lowest ? ' · tiefstens ' + tmp(f.lowest.min) + ' am ' + shortDate(f.lowest.date) : '');
+  const l = li('<div class="who"><b>Frostwarnung ab ' + tmp(f.min) + '</b><div>' + st + '</div></div>');
+  const go = (action, label) => act('POST', 'plants/' + p.id + '/frost', { action }, d => d.points ? label + ', +' + d.points + ' Punkte fürs Team' : label);
+  if (f.action === 'in') l.appendChild(btn('Reingeholt', 'done', async () => { if (await askConfirm(p.name, 'Vor dem Frost reingeholt?', 'Ja, reingeholt')) go('in', 'Reingeholt'); }));
+  else if (f.in_since) l.appendChild(btn('Rausgestellt', f.action === 'out' ? 'done' : 'link', async () => { if (await askConfirm(p.name, 'Wieder rausgestellt?', 'Ja, rausgestellt')) go('out', 'Rausgestellt'); }));
+  return l;
+}
 const plantDoneBtn = (label, t) => doneBtn(label, () => act('POST', 'plant-tasks/' + t.id + '/done', null, d => d.points ? '+' + d.points + ' Punkte fürs Team' : 'Erledigt'));
 async function slowAct(method, url, body, msg, btnEl) {
   if (busy) return;
@@ -472,13 +501,24 @@ function taskForm(t, onSubmit, extra) {
   f.addEventListener('submit', e => { e.preventDefault(); onSubmit({ title: f.title.value, details: f.details.value, start: f.start.value, end: f.end.value, interval_days: f.iv.value ? +f.iv.value : null }, f); });
   return f;
 }
+// Kopfzeile einer Pflanze zum Auf- und Zuklappen, zugeklappt mit kurzem Status
+function plantToggle(p, open) {
+  const nDue = p.tasks.filter(t => t.due).length, f = p.frost;
+  const st = f?.action === 'in' ? '<span class="pill bad">vor Frost reinholen</span>' : f?.action === 'out' ? '<span class="pill warn">wieder rausstellen</span>' : nDue ? '<span class="pill warn">' + nDue + ' fällig</span>' : '<span class="pill ok">nichts fällig</span>';
+  const b = document.createElement('button'); b.type = 'button'; b.className = 'plant-toggle'; b.setAttribute('aria-expanded', open);
+  b.innerHTML = '<h2>' + esc(p.name) + '</h2><span class="plant-meta">' + (p.location ? '<span class="pill">' + esc(p.location) + '</span>' : '') + st + '<span class="chev" aria-hidden="true"></span></span>';
+  b.addEventListener('click', () => { if (open) plOpen.delete(p.id); else plOpen.add(p.id); savePlOpen(); pending = null; render(); });
+  return b;
+}
 function renderPlants() {
   const due = [];
   for (const p of S.plants) for (const t of p.tasks) if (t.due) due.push({ p, t });
   due.sort((a, b) => a.t.days_left - b.t.days_left);
-  $('badgePlants').hidden = !due.length; $('badgePlants').textContent = due.length;
+  const frost = S.plants.filter(p => p.frost?.action);
+  $('badgePlants').hidden = !(due.length + frost.length); $('badgePlants').textContent = due.length + frost.length;
   const ph = $('plantHome'); ph.innerHTML = '';
-  $('plantHomeCard').hidden = !due.length;
+  $('plantHomeCard').hidden = !(due.length + frost.length);
+  for (const p of frost) { const l = frostLine(p); l.querySelector('b').textContent = p.name + ': ' + (p.frost.action === 'in' ? 'vor Frost reinholen' : 'wieder rausstellen'); ph.appendChild(l); }
   for (const { p, t } of due) {
     const l = li('<div class="who"><b>' + esc(p.name) + ': ' + esc(t.title) + '</b><div>' + plantStatus(t) + (t.details ? ' · ' + esc(t.details) : '') + '</div></div>');
     l.appendChild(plantDoneBtn(p.name + ': ' + t.title, t)); ph.appendChild(l);
@@ -489,22 +529,25 @@ function renderPlants() {
   if (!S.plants.length) { const c = document.createElement('div'); c.className = 'card'; c.innerHTML = '<p class="empty">Noch keine Pflanzen erfasst.</p>'; box.appendChild(c); }
   for (const p of S.plants) {
     const card = document.createElement('div'); card.className = 'card';
+    const open = plOpen.has(p.id) || plEditing === p.id || p.tasks.some(t => t.id === ptEditing);
+    if (plEditing !== p.id) card.appendChild(plantToggle(p, open));
+    if (!open) { box.appendChild(card); continue; }
     if (plEditing === p.id) {
       const f = document.createElement('form'); f.className = 'edit';
-      f.innerHTML = '<label>Pflanze<input type="text" name="n" maxlength="80" required></label><div class="row"><label class="grow">Standort<input type="text" name="loc" maxlength="80"></label><label class="grow">Notiz<input type="text" name="notes" maxlength="300"></label></div><p class="hint">Nach einem Standortwechsel den Pflegeplan neu erstellen.</p><div class="row"></div>';
-      f.n.value = p.name; f.loc.value = p.location || ''; f.notes.value = p.notes || '';
+      f.innerHTML = '<label>Pflanze<input type="text" name="n" maxlength="80" required></label><div class="row"><label class="grow">Standort<input type="text" name="loc" maxlength="80"></label><label class="grow">Notiz<input type="text" name="notes" maxlength="300"></label></div><label>Frostwarnung ab °C (leer = keine)<input type="number" name="frost" min="-30" max="10" step="1" inputmode="numeric"></label><p class="hint">Mit Frostwarnung erinnert die App laut Wetterprognose ans Reinholen und Wieder-Rausstellen. Nach einem Standortwechsel den Pflegeplan neu erstellen.</p><div class="row"></div>';
+      f.n.value = p.name; f.loc.value = p.location || ''; f.notes.value = p.notes || ''; f.frost.value = p.frost_min ?? '';
       const bar = f.querySelectorAll('.row')[1];
       const sv = document.createElement('button'); sv.type = 'submit'; sv.className = 'primary'; sv.textContent = 'Speichern'; bar.appendChild(sv);
       bar.appendChild(btn('Abbrechen', 'link', () => { plEditing = null; render(); }));
-      f.addEventListener('submit', async e => { e.preventDefault(); plEditing = null; await act('PATCH', 'plants/' + p.id, { name: f.n.value, location: f.loc.value, notes: f.notes.value }, 'Gespeichert'); });
+      f.addEventListener('submit', async e => { e.preventDefault(); plEditing = null; await act('PATCH', 'plants/' + p.id, { name: f.n.value, location: f.loc.value, notes: f.notes.value, frost_min: f.frost.value === '' ? null : +f.frost.value }, 'Gespeichert'); });
       card.appendChild(f);
     } else {
       const head = document.createElement('div');
-      head.innerHTML = '<div class="goal-head"><h2>' + esc(p.name) + '</h2>' + (p.location ? '<span class="pill">' + esc(p.location) + '</span>' : '') + '</div>' +
-        (p.botanical ? '<p class="hint"><i>' + esc(p.botanical) + '</i></p>' : '') + (p.summary ? '<p class="hint">' + esc(p.summary) + '</p>' : '') + (p.notes ? '<p class="hint">Notiz: ' + esc(p.notes) + '</p>' : '');
+      head.innerHTML = (p.botanical ? '<p class="hint"><i>' + esc(p.botanical) + '</i></p>' : '') + (p.summary ? '<p class="hint">' + esc(p.summary) + '</p>' : '') + (p.notes ? '<p class="hint">Notiz: ' + esc(p.notes) + '</p>' : '');
       card.appendChild(head);
     }
     const ul = document.createElement('ul'); ul.className = 'list';
+    const fl = frostLine(p); if (fl) ul.appendChild(fl);
     if (!p.tasks.length) ul.appendChild(li('<p class="empty">Kein Pflegeplan. Neu erstellen oder Schritte von Hand hinzufügen.</p>'));
     for (const t of p.tasks) {
       if (ptEditing === t.id) {
@@ -588,6 +631,12 @@ $('visitForm').addEventListener('submit', async e => {
   if (d) { selected.clear(); $('vNote').value = ''; $('vDate').value = S.today; render(); }
 });
 $('settingsForm').addEventListener('submit', async e => { e.preventDefault(); await act('POST', 'settings', { morning: $('sMorning').value, evening: $('sEvening').value, teamGoal: +$('sGoal').value }, 'Gespeichert'); });
+$('weatherForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  $('wSubmit').disabled = true;
+  try { await act('POST', 'settings/weather', { place: $('wPlace').value }, d => d.removed ? 'Ort entfernt, Frostwarnungen aus' : 'Ort gesetzt: ' + d.place + (d.forecast_ok ? '' : ' (Prognose noch nicht abrufbar)')); }
+  finally { $('wSubmit').disabled = false; }
+});
 $('logout').addEventListener('click', async () => { await fetch('/auth/logout', { method: 'POST' }); location.href = '/'; });
 for (const b of document.querySelectorAll('.tab')) b.addEventListener('click', () => { tab = b.dataset.tab; pending = null; editing = null; hEditing = null; plEditing = null; ptEditing = null; render(); if (tab === 'health') loadHealth(); if (tab === 'chores') loadChoreHist(); });
 
