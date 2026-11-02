@@ -11,7 +11,7 @@ services:
       - -c
       - >-
         rm -rf /tmp/app && mkdir -p /tmp/app &&
-        node -e "fetch('https://api.github.com/repos/'+process.env.GITHUB_REPO+'/tarball/'+process.env.GITHUB_REF,{headers:{'User-Agent':'flechte'}}).then(async r=>{if(!r.ok)throw new Error('GitHub '+r.status);require('fs').writeFileSync('/tmp/app.tgz',Buffer.from(await r.arrayBuffer()))}).catch(e=>{console.error(e.message);process.exit(1)})" &&
+        node -e "fetch('https://api.github.com/repos/'+process.env.GITHUB_REPO+'/tarball/'+process.env.GITHUB_REF,{headers:Object.assign({'User-Agent':'flechte'},process.env.GITHUB_TOKEN?{Authorization:'Bearer '+process.env.GITHUB_TOKEN}:{})}).then(async r=>{if(!r.ok)throw new Error('GitHub '+r.status);require('fs').writeFileSync('/tmp/app.tgz',Buffer.from(await r.arrayBuffer()))}).catch(e=>{console.error(e.message);process.exit(1)})" &&
         tar xzf /tmp/app.tgz -C /tmp/app --strip-components=1 && rm /tmp/app.tgz &&
         cd /tmp/app && exec node server.js
     environment:
@@ -30,6 +30,8 @@ services:
       PLANT_REGION: ${PLANT_REGION:-}
       GITHUB_REPO: ${GITHUB_REPO}
       GITHUB_REF: ${GITHUB_REF:-main}
+      # Nur für private Repos: Fine-grained Token mit Lesezugriff (Contents: read) auf dieses Repo
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8080}:8080"
     volumes:
