@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS meals (date TEXT PRIMARY KEY, title TEXT NOT NULL, no
 `);
 const q = (sql) => db.prepare(sql);
 try { db.exec('ALTER TABLE chores ADD COLUMN due_override TEXT'); } catch { /* Spalte existiert schon */ }
+// Mittags-Push (nur Fälliges und offene Gesundheitspunkte)
+try { db.exec("ALTER TABLE user_settings ADD COLUMN noon TEXT NOT NULL DEFAULT '12:00'"); } catch { /* Spalte existiert schon */ }
 // Monatsregel: n-ter Wochentag im Monat (month_nth 1-5 oder -1 = letzter, month_wday 1=Mo..7=So), Erinnerung lead_days vorher
 for (const col of ['month_nth INTEGER', 'month_wday INTEGER', 'lead_days INTEGER NOT NULL DEFAULT 0', 'remind_slot TEXT']) {
   try { db.exec('ALTER TABLE chores ADD COLUMN ' + col); } catch { /* Spalte existiert schon */ }
@@ -257,7 +259,7 @@ function state(user) {
     today: localNow().date,
     teamGoal: +meta.get('team_goal', 120),
     vapidPublicKey: VAPID_PUBLIC,
-    settings: q('SELECT morning, evening FROM user_settings WHERE user=?').get(user) || { morning: '09:00', evening: '18:00' },
+    settings: q('SELECT morning, noon, evening FROM user_settings WHERE user=?').get(user) || { morning: '09:00', noon: '12:00', evening: '18:00' },
     chores: q('SELECT * FROM chores ORDER BY name').all().map(c => ({ ...c, ...choreExtra(c) })),
     todos: q("SELECT * FROM todos WHERE done=0 OR done_at >= ? ORDER BY done, COALESCE(due, '9999'), id").all(new Date(Date.now() - 14 * 864e5).toISOString()),
     guests: q('SELECT * FROM guests ORDER BY name COLLATE NOCASE').all(),
@@ -453,10 +455,10 @@ const ops = {
   shopForget(name) { const r = q('DELETE FROM shopping_names WHERE name=?').run(str(name, 80)); if (!r.changes) fail(404, 'Vorschlag nicht gefunden'); return { ok: true }; },
   shopClearDone() { const r = q('DELETE FROM shopping WHERE done=1').run(); return { ok: true, removed: Number(r.changes) }; },
   settingsSet(user, b) {
-    const cur = q('SELECT morning, evening FROM user_settings WHERE user=?').get(user) || { morning: '09:00', evening: '18:00' };
-    const mo = b.morning !== undefined ? str(b.morning, 5) : cur.morning, ev = b.evening !== undefined ? str(b.evening, 5) : cur.evening;
-    if (!isTime(mo) || !isTime(ev)) fail(400, 'Ungültige Uhrzeit (HH:MM)');
-    q('INSERT INTO user_settings(user,morning,evening) VALUES(?,?,?) ON CONFLICT(user) DO UPDATE SET morning=excluded.morning, evening=excluded.evening').run(user, mo, ev);
+    const cur = q('SELECT morning, noon, evening FROM user_settings WHERE user=?').get(user) || { morning: '09:00', noon: '12:00', evening: '18:00' };
+    const mo = b.morning !== undefined ? str(b.morning, 5) : cur.morning, no = b.noon !== undefined ? str(b.noon, 5) : cur.noon, ev = b.evening !== undefined ? str(b.evening, 5) : cur.evening;
+    if (!isTime(mo) || !isTime(no) || !isTime(ev)) fail(400, 'Ungültige Uhrzeit (HH:MM)');
+    q('INSERT INTO user_settings(user,morning,noon,evening) VALUES(?,?,?,?) ON CONFLICT(user) DO UPDATE SET morning=excluded.morning, noon=excluded.noon, evening=excluded.evening').run(user, mo, no, ev);
     if (b.teamGoal !== undefined) { const g = int(b.teamGoal, 10, 2000); if (!g) fail(400, 'Ungültiges Teamziel (10-2000)'); meta.set('team_goal', g); }
     return { ok: true };
   },
@@ -1000,7 +1002,7 @@ function buildMessage(user, slot) {
       for (const g of due) q('INSERT INTO guest_reminders(guest_id,user,date) VALUES(?,?,?) ON CONFLICT(guest_id,user) DO UPDATE SET date=excluded.date').run(g.id, user, today);
     }
   }
-  if (slot === 'evening') {
+  if (slot === 'noon' || slot === 'evening') {
     const open = healthDay(user, today).items.filter(i => !i.done);
     if (open.length) lines.push('Gesundheit, noch offen: ' + open.map(i => i.name).join(', '));
   }
@@ -1015,14 +1017,14 @@ function buildMessage(user, slot) {
   const goal = +meta.get('team_goal', 120);
   const ws = weekStart(localNow().date);
   const team = q('SELECT by, points, date FROM log WHERE date >= ?').all(new Date((ws - 1) * 864e5).toISOString().slice(0, 10)).filter(e => weekStart(e.date) === ws).reduce((a, e) => a + e.points, 0);
-  const title = slot === 'morning' ? 'Guten Morgen' : 'Kurzer Check am Abend';
+  const title = slot === 'morning' ? 'Guten Morgen' : slot === 'noon' ? 'Kurzer Check am Mittag' : 'Kurzer Check am Abend';
   return { title, body: lines.join('\n') + `\nTeamziel: ${team}/${goal} Punkte`, url: '/', tag: 'flechte-' + slot };
 }
 async function scheduler() {
   const now = localNow();
   for (const user of Object.keys(USERS)) {
-    const s = q('SELECT morning, evening FROM user_settings WHERE user=?').get(user) || { morning: '09:00', evening: '18:00' };
-    for (const slot of ['morning', 'evening']) {
+    const s = q('SELECT morning, noon, evening FROM user_settings WHERE user=?').get(user) || { morning: '09:00', noon: '12:00', evening: '18:00' };
+    for (const slot of ['morning', 'noon', 'evening']) {
       if (now.time < s[slot]) continue;
       // nur innerhalb von 3 Stunden nach der Uhrzeit nachholen, einmal pro Tag
       const [h, mi] = s[slot].split(':').map(Number), [nh, nmi] = now.time.split(':').map(Number);
@@ -1149,15 +1151,15 @@ const MCP_TOOLS = [
   { name: 'log_visit', description: 'Besuch eintragen oder planen. Vergangene/heutige Besuche geben beiden Personen sofort je 10 Punkte; Besuche in der Zukunft gelten als geplant, die Punkte kommen automatisch am Besuchstag.', inputSchema: { type: 'object', properties: { date: P('string', 'YYYY-MM-DD, Zukunft = geplant (max. 1 Jahr voraus)'), guest_ids: { type: 'array', items: { type: 'integer' }, description: 'IDs aus list_guests' }, note: P('string', 'Notiz (optional)'), person: PERSON }, required: ['date', 'guest_ids'] }, run: (u, a) => ops.visitAdd(actor(u, a, Object.keys(USERS)[0]), { date: a.date, guestIds: a.guest_ids, note: a.note }) },
   { name: 'list_visits', description: 'Besuche inkl. geplanter (planned=true), neueste zuerst.', inputSchema: { type: 'object', properties: { limit: P('integer', 'Anzahl, Standard 20') } }, readOnly: true, run: (u, a) => q('SELECT id, date, note FROM visits ORDER BY date DESC, id DESC LIMIT ?').all(int(a.limit, 1, 200) || 20).map(v => ({ ...v, planned: v.date > localNow().date, guests: q('SELECT g.name FROM visit_guests vg JOIN guests g ON g.id=vg.guest_id WHERE vg.visit_id=?').all(v.id).map(r => r.name) })) },
   { name: 'delete_visit', description: 'Besuch löschen (Punkte werden zurückgenommen).', inputSchema: { type: 'object', properties: { id: P('integer', 'ID') }, required: ['id'] }, destructive: true, run: (u, a) => ops.visitDelete(a.id) },
-  { name: 'get_settings', description: 'Push-Zeiten beider Personen, Teamziel und Ort der Wetterprognose für Frostwarnungen.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => { const w = weatherConfig(); return { push_times: Object.keys(USERS).map(k => ({ person: k, ...(q('SELECT morning, evening FROM user_settings WHERE user=?').get(k) || { morning: '09:00', evening: '18:00' }) })), team_goal: +meta.get('team_goal', 120), weather_location: w }; } },
-  { name: 'update_settings', description: 'Push-Zeiten (HH:MM) einer Person, das gemeinsame Wochen-Teamziel und/oder den Ort der Wetterprognose für Frostwarnungen ändern. Für Push-Zeiten ist person nötig.', inputSchema: { type: 'object', properties: { person: PERSON, morning: P('string', 'HH:MM'), evening: P('string', 'HH:MM'), team_goal: P('integer', 'Punkte pro Woche (10-2000)'), weather_place: P('string', 'Ort der Pflanzen für die Wetterprognose: PLZ und Ort (wird gesucht) oder Koordinaten "lat, lon". Leerer String entfernt den Ort.'), weather_lat: P('number', 'Breitengrad (statt Ortssuche, zusammen mit weather_lon)'), weather_lon: P('number', 'Längengrad') } }, run: async (u, a) => {
+  { name: 'get_settings', description: 'Push-Zeiten beider Personen, Teamziel und Ort der Wetterprognose für Frostwarnungen.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => { const w = weatherConfig(); return { push_times: Object.keys(USERS).map(k => ({ person: k, ...(q('SELECT morning, noon, evening FROM user_settings WHERE user=?').get(k) || { morning: '09:00', noon: '12:00', evening: '18:00' }) })), team_goal: +meta.get('team_goal', 120), weather_location: w }; } },
+  { name: 'update_settings', description: 'Push-Zeiten (HH:MM, morgens, mittags, abends) einer Person, das gemeinsame Wochen-Teamziel und/oder den Ort der Wetterprognose für Frostwarnungen ändern. Für Push-Zeiten ist person nötig.', inputSchema: { type: 'object', properties: { person: PERSON, morning: P('string', 'HH:MM'), noon: P('string', 'HH:MM'), evening: P('string', 'HH:MM'), team_goal: P('integer', 'Punkte pro Woche (10-2000)'), weather_place: P('string', 'Ort der Pflanzen für die Wetterprognose: PLZ und Ort (wird gesucht) oder Koordinaten "lat, lon". Leerer String entfernt den Ort.'), weather_lat: P('number', 'Breitengrad (statt Ortssuche, zusammen mit weather_lon)'), weather_lon: P('number', 'Längengrad') } }, run: async (u, a) => {
       const out = { ok: true };
       if (a.weather_place !== undefined || a.weather_lat !== undefined || a.weather_lon !== undefined) out.weather = await ops.weatherSet({ place: a.weather_place, lat: a.weather_lat, lon: a.weather_lon });
-      if (a.morning === undefined && a.evening === undefined) {
+      if (a.morning === undefined && a.noon === undefined && a.evening === undefined) {
         if (a.team_goal === undefined) { if (!out.weather) fail(400, 'Nichts zu ändern'); return out; }
         const g = int(a.team_goal, 10, 2000); if (!g) fail(400, 'Ungültiges Teamziel (10-2000)'); meta.set('team_goal', g); return out;
       }
-      return { ...out, ...ops.settingsSet(actor(u, a), { morning: a.morning, evening: a.evening, teamGoal: a.team_goal }) };
+      return { ...out, ...ops.settingsSet(actor(u, a), { morning: a.morning, noon: a.noon, evening: a.evening, teamGoal: a.team_goal }) };
     } },
   { name: 'get_weather', description: 'Wetterprognose der nächsten 10 Tage (Tiefst-/Höchstwerte) am eingestellten Ort, die für die Frostwarnungen der Pflanzen verwendet wird.', inputSchema: { type: 'object', properties: {} }, readOnly: true, run: () => forecast() },
   { name: 'get_chore_history', description: 'Verlauf: wann welche Haushaltsaufgabe von wem erledigt wurde, für einen Monat.', inputSchema: { type: 'object', properties: { month: P('string', 'YYYY-MM, Standard aktueller Monat'), chore_id: P('integer', 'Nur diese Aufgabe (optional)') } }, readOnly: true, run: (u, a) => ({ month: monthOf(a.month), entries: choreHistory(a.month, a.chore_id) }) },

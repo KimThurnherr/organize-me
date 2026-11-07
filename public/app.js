@@ -233,7 +233,7 @@ function render() {
   fillSelect($('cWho'), false); fillSelect($('tWho'), true);
   if (!$('vDate').value) { $('vDate').value = S.today; } $('vDate').max = dstrN(dayNum(S.today) + 365);
   if (document.activeElement?.closest('#settingsForm') == null) {
-    $('sMorning').value = S.settings.morning; $('sEvening').value = S.settings.evening; $('sGoal').value = S.teamGoal;
+    $('sMorning').value = S.settings.morning; $('sNoon').value = S.settings.noon || '12:00'; $('sEvening').value = S.settings.evening; $('sGoal').value = S.teamGoal;
   }
   if (document.activeElement !== $('wPlace')) $('wPlace').value = S.weather?.configured ? S.weather.place || '' : '';
   {
@@ -630,7 +630,7 @@ $('visitForm').addEventListener('submit', async e => {
   const d = await act('POST', 'visits', { date: $('vDate').value, guestIds: [...selected], note: $('vNote').value }, r => r.planned ? 'Besuch geplant, Punkte gibt es am Besuchstag' : 'Besuch gespeichert, je +10 Punkte');
   if (d) { selected.clear(); $('vNote').value = ''; $('vDate').value = S.today; render(); }
 });
-$('settingsForm').addEventListener('submit', async e => { e.preventDefault(); await act('POST', 'settings', { morning: $('sMorning').value, evening: $('sEvening').value, teamGoal: +$('sGoal').value }, 'Gespeichert'); });
+$('settingsForm').addEventListener('submit', async e => { e.preventDefault(); await act('POST', 'settings', { morning: $('sMorning').value, noon: $('sNoon').value, evening: $('sEvening').value, teamGoal: +$('sGoal').value }, 'Gespeichert'); });
 $('weatherForm').addEventListener('submit', async e => {
   e.preventDefault();
   $('wSubmit').disabled = true;
